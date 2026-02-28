@@ -69,7 +69,9 @@ defmodule Jido.MemoryOS.Migration do
              limit: legacy_limit,
              order: :asc
            }) do
-      migrate_records(target, records,
+      migrate_records(
+        target,
+        records,
         opts
         |> Keyword.put(:legacy_store, legacy_store)
         |> Keyword.put(:legacy_namespace, legacy_namespace)
