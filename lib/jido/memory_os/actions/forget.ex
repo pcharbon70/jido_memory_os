@@ -13,10 +13,28 @@ defmodule Jido.MemoryOS.Actions.Forget do
       correlation_id: [type: :string, required: false, doc: "Trace correlation id"],
       store: [type: :any, required: false, doc: "Store declaration override"],
       store_opts: [type: :any, required: false, doc: "Store options override"],
+      server: [type: :any, required: false, doc: "Memory manager server override"],
+      config: [type: :any, required: false, doc: "Runtime config overrides"],
+      app_config: [type: :any, required: false, doc: "Application config overrides"],
+      agent_id: [type: :any, required: false, doc: "Agent id override for namespace resolution"],
+      timeout_ms: [type: :any, required: false, doc: "Manager request timeout override"],
+      call_timeout: [type: :any, required: false, doc: "GenServer call timeout override"],
       memory_result_key: [type: :any, required: false, doc: "Result key for delete boolean"]
     ]
 
-  @option_keys [:tier, :namespace, :correlation_id, :store, :store_opts]
+  @option_keys [
+    :tier,
+    :namespace,
+    :correlation_id,
+    :store,
+    :store_opts,
+    :server,
+    :config,
+    :app_config,
+    :agent_id,
+    :timeout_ms,
+    :call_timeout
+  ]
 
   @impl true
   def run(params, context) do
