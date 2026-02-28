@@ -42,7 +42,19 @@ defmodule Jido.MemoryOS.Config do
     :retry_jitter_ms,
     :dead_letter_limit,
     :consolidation_debounce_ms,
-    :auto_consolidate
+    :auto_consolidate,
+    :scheduler_strategy,
+    :weighted_priority_bias,
+    :fairness_max_wait_ms,
+    :adaptive_throttle_enabled,
+    :adaptive_throttle_target_depth,
+    :adaptive_throttle_soft_limit,
+    :query_cache_enabled,
+    :query_cache_ttl_ms,
+    :query_cache_max_entries,
+    :journal_path,
+    :journal_limit,
+    :replay_on_start
   ]
   @governance_keys [:policy, :approvals, :audit, :retention, :masking]
 
@@ -102,7 +114,19 @@ defmodule Jido.MemoryOS.Config do
       retry_jitter_ms: 20,
       dead_letter_limit: 200,
       consolidation_debounce_ms: 150,
-      auto_consolidate: true
+      auto_consolidate: true,
+      scheduler_strategy: :round_robin,
+      weighted_priority_bias: 3,
+      fairness_max_wait_ms: 750,
+      adaptive_throttle_enabled: true,
+      adaptive_throttle_target_depth: 192,
+      adaptive_throttle_soft_limit: 0.8,
+      query_cache_enabled: true,
+      query_cache_ttl_ms: 500,
+      query_cache_max_entries: 512,
+      journal_path: nil,
+      journal_limit: 2_000,
+      replay_on_start: true
     },
     governance: %{
       policy: %{
@@ -761,6 +785,147 @@ defmodule Jido.MemoryOS.Config do
         @defaults.manager.auto_consolidate
       )
 
+    scheduler_strategy =
+      map_get(normalized, :scheduler_strategy, @defaults.manager.scheduler_strategy)
+
+    {scheduler_strategy, errors} =
+      validate_scheduler_strategy(
+        scheduler_strategy,
+        path ++ [:scheduler_strategy],
+        errors,
+        @defaults.manager.scheduler_strategy
+      )
+
+    weighted_priority_bias =
+      map_get(normalized, :weighted_priority_bias, @defaults.manager.weighted_priority_bias)
+
+    {weighted_priority_bias, errors} =
+      validate_positive_integer(
+        weighted_priority_bias,
+        path ++ [:weighted_priority_bias],
+        errors,
+        @defaults.manager.weighted_priority_bias
+      )
+
+    fairness_max_wait_ms =
+      map_get(normalized, :fairness_max_wait_ms, @defaults.manager.fairness_max_wait_ms)
+
+    {fairness_max_wait_ms, errors} =
+      validate_non_negative_integer(
+        fairness_max_wait_ms,
+        path ++ [:fairness_max_wait_ms],
+        errors,
+        @defaults.manager.fairness_max_wait_ms
+      )
+
+    adaptive_throttle_enabled =
+      map_get(
+        normalized,
+        :adaptive_throttle_enabled,
+        @defaults.manager.adaptive_throttle_enabled
+      )
+
+    {adaptive_throttle_enabled, errors} =
+      validate_boolean(
+        adaptive_throttle_enabled,
+        path ++ [:adaptive_throttle_enabled],
+        errors,
+        @defaults.manager.adaptive_throttle_enabled
+      )
+
+    adaptive_throttle_target_depth =
+      map_get(
+        normalized,
+        :adaptive_throttle_target_depth,
+        @defaults.manager.adaptive_throttle_target_depth
+      )
+
+    {adaptive_throttle_target_depth, errors} =
+      validate_positive_integer(
+        adaptive_throttle_target_depth,
+        path ++ [:adaptive_throttle_target_depth],
+        errors,
+        @defaults.manager.adaptive_throttle_target_depth
+      )
+
+    adaptive_throttle_soft_limit =
+      map_get(
+        normalized,
+        :adaptive_throttle_soft_limit,
+        @defaults.manager.adaptive_throttle_soft_limit
+      )
+
+    {adaptive_throttle_soft_limit, errors} =
+      validate_unit_number(
+        adaptive_throttle_soft_limit,
+        path ++ [:adaptive_throttle_soft_limit],
+        errors,
+        @defaults.manager.adaptive_throttle_soft_limit
+      )
+
+    query_cache_enabled =
+      map_get(normalized, :query_cache_enabled, @defaults.manager.query_cache_enabled)
+
+    {query_cache_enabled, errors} =
+      validate_boolean(
+        query_cache_enabled,
+        path ++ [:query_cache_enabled],
+        errors,
+        @defaults.manager.query_cache_enabled
+      )
+
+    query_cache_ttl_ms =
+      map_get(normalized, :query_cache_ttl_ms, @defaults.manager.query_cache_ttl_ms)
+
+    {query_cache_ttl_ms, errors} =
+      validate_positive_integer(
+        query_cache_ttl_ms,
+        path ++ [:query_cache_ttl_ms],
+        errors,
+        @defaults.manager.query_cache_ttl_ms
+      )
+
+    query_cache_max_entries =
+      map_get(normalized, :query_cache_max_entries, @defaults.manager.query_cache_max_entries)
+
+    {query_cache_max_entries, errors} =
+      validate_positive_integer(
+        query_cache_max_entries,
+        path ++ [:query_cache_max_entries],
+        errors,
+        @defaults.manager.query_cache_max_entries
+      )
+
+    journal_path = map_get(normalized, :journal_path, @defaults.manager.journal_path)
+
+    {journal_path, errors} =
+      validate_optional_string(
+        journal_path,
+        path ++ [:journal_path],
+        errors,
+        @defaults.manager.journal_path
+      )
+
+    journal_limit = map_get(normalized, :journal_limit, @defaults.manager.journal_limit)
+
+    {journal_limit, errors} =
+      validate_positive_integer(
+        journal_limit,
+        path ++ [:journal_limit],
+        errors,
+        @defaults.manager.journal_limit
+      )
+
+    replay_on_start = map_get(normalized, :replay_on_start, @defaults.manager.replay_on_start)
+
+    {replay_on_start, errors} =
+      validate_boolean(
+        replay_on_start,
+        path ++ [:replay_on_start],
+        errors,
+        @defaults.manager.replay_on_start
+      )
+
     {%{
        queue_max_depth: queue_max_depth,
        queue_per_agent: queue_per_agent,
@@ -770,7 +935,19 @@ defmodule Jido.MemoryOS.Config do
        retry_jitter_ms: retry_jitter_ms,
        dead_letter_limit: dead_letter_limit,
        consolidation_debounce_ms: consolidation_debounce_ms,
-       auto_consolidate: auto_consolidate
+       auto_consolidate: auto_consolidate,
+       scheduler_strategy: scheduler_strategy,
+       weighted_priority_bias: weighted_priority_bias,
+       fairness_max_wait_ms: fairness_max_wait_ms,
+       adaptive_throttle_enabled: adaptive_throttle_enabled,
+       adaptive_throttle_target_depth: adaptive_throttle_target_depth,
+       adaptive_throttle_soft_limit: adaptive_throttle_soft_limit,
+       query_cache_enabled: query_cache_enabled,
+       query_cache_ttl_ms: query_cache_ttl_ms,
+       query_cache_max_entries: query_cache_max_entries,
+       journal_path: journal_path,
+       journal_limit: journal_limit,
+       replay_on_start: replay_on_start
      }, errors}
   end
 
@@ -1020,6 +1197,36 @@ defmodule Jido.MemoryOS.Config do
     end
   end
 
+  @spec validate_scheduler_strategy(term(), [atom()], [ConfigError.t()], atom()) ::
+          {atom(), [ConfigError.t()]}
+  defp validate_scheduler_strategy(value, path, errors, fallback) do
+    normalized =
+      case value do
+        :fifo -> :fifo
+        :round_robin -> :round_robin
+        :weighted_priority -> :weighted_priority
+        "fifo" -> :fifo
+        "round_robin" -> :round_robin
+        "weighted_priority" -> :weighted_priority
+        _ -> nil
+      end
+
+    if normalized do
+      {normalized, errors}
+    else
+      {fallback,
+       [
+         error(
+           path,
+           :invalid_value,
+           "must be :fifo, :round_robin, or :weighted_priority",
+           value
+         )
+         | errors
+       ]}
+    end
+  end
+
   @spec validate_positive_integer(term(), [atom()], [ConfigError.t()], pos_integer()) ::
           {pos_integer(), [ConfigError.t()]}
   defp validate_positive_integer(value, _path, errors, _fallback)
@@ -1078,6 +1285,25 @@ defmodule Jido.MemoryOS.Config do
 
   defp validate_non_empty_string(value, path, errors, fallback) do
     {fallback, [error(path, :invalid_type, "must be a non-empty string", value) | errors]}
+  end
+
+  @spec validate_optional_string(term(), [atom()], [ConfigError.t()], String.t() | nil) ::
+          {String.t() | nil, [ConfigError.t()]}
+  defp validate_optional_string(nil, _path, errors, _fallback), do: {nil, errors}
+
+  defp validate_optional_string(value, path, errors, fallback) when is_binary(value) do
+    trimmed = String.trim(value)
+
+    if trimmed == "" do
+      {fallback,
+       [error(path, :invalid_type, "must be nil or a non-empty string", value) | errors]}
+    else
+      {trimmed, errors}
+    end
+  end
+
+  defp validate_optional_string(value, path, errors, fallback) do
+    {fallback, [error(path, :invalid_type, "must be nil or a non-empty string", value) | errors]}
   end
 
   @spec validate_boolean(term(), [atom()], [ConfigError.t()], boolean()) ::
