@@ -1,13 +1,13 @@
-defmodule Jido.MemoryOS.Actions.Remember do
+defmodule Jido.MemoryOS.Actions.Consolidate do
   @moduledoc """
-  Action wrapper for `Jido.MemoryOS.remember/3`.
+  Action wrapper for `Jido.MemoryOS.consolidate/2`.
   """
 
   use Jido.Action,
-    name: "memory_os_remember",
-    description: "Remember one item via MemoryOS",
+    name: "memory_os_consolidate",
+    description: "Run tier consolidation via MemoryOS",
     schema: [
-      tier: [type: :any, required: false, doc: "Target tier: short|mid|long"],
+      tier: [type: :any, required: false, doc: "Tier override for consolidation context"],
       namespace: [type: :string, required: false, doc: "Explicit namespace override"],
       correlation_id: [type: :string, required: false, doc: "Trace correlation id"],
       store: [type: :any, required: false, doc: "Store declaration override"],
@@ -18,17 +18,11 @@ defmodule Jido.MemoryOS.Actions.Remember do
       agent_id: [type: :any, required: false, doc: "Agent id override for namespace resolution"],
       timeout_ms: [type: :any, required: false, doc: "Manager request timeout override"],
       call_timeout: [type: :any, required: false, doc: "GenServer call timeout override"],
-      mem_os: [type: :any, required: false, doc: "MemoryOS lifecycle metadata overrides"],
-      class: [type: :any, required: false, doc: "Memory class"],
-      kind: [type: :any, required: false, doc: "Memory kind"],
-      text: [type: :any, required: false, doc: "Searchable text"],
-      content: [type: :any, required: false, doc: "Structured payload"],
-      tags: [type: :any, required: false, doc: "Tag list"],
-      source: [type: :any, required: false, doc: "Source string"],
-      observed_at: [type: :any, required: false, doc: "Timestamp ms"],
-      expires_at: [type: :any, required: false, doc: "Expiration timestamp ms"],
-      metadata: [type: :any, required: false, doc: "Metadata map"],
-      memory_result_key: [type: :any, required: false, doc: "Result key for record id"]
+      memory_result_key: [
+        type: :any,
+        required: false,
+        doc: "Result key for consolidation summary"
+      ]
     ]
 
   @option_keys [
@@ -42,20 +36,18 @@ defmodule Jido.MemoryOS.Actions.Remember do
     :app_config,
     :agent_id,
     :timeout_ms,
-    :call_timeout,
-    :mem_os
+    :call_timeout
   ]
 
   @impl true
   def run(params, context) do
     map_params = normalize_map(params)
-    attrs = Map.drop(map_params, @option_keys ++ [:memory_result_key])
     opts = extract_opts(map_params)
 
-    case Jido.MemoryOS.remember(context, attrs, opts) do
-      {:ok, record} ->
-        key = map_get(map_params, :memory_result_key, :last_memory_id)
-        {:ok, %{key => record.id}}
+    case Jido.MemoryOS.consolidate(context, opts) do
+      {:ok, summary} ->
+        key = map_get(map_params, :memory_result_key, :memory_consolidation)
+        {:ok, %{key => summary}}
 
       {:error, reason} ->
         {:error, reason}
