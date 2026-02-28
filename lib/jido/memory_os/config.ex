@@ -11,7 +11,16 @@ defmodule Jido.MemoryOS.Config do
   alias Jido.MemoryOS.ConfigError
 
   @tiers [:short, :mid, :long]
-  @root_keys [:namespace_template, :tiers, :retrieval, :plugin, :safety, :lifecycle, :manager]
+  @root_keys [
+    :namespace_template,
+    :tiers,
+    :retrieval,
+    :plugin,
+    :safety,
+    :lifecycle,
+    :manager,
+    :governance
+  ]
   @tier_keys [:namespace_suffix, :store, :store_opts, :max_records, :ttl_ms, :promotion_threshold]
   @retrieval_keys [:limit, :ranking, :fallback]
   @ranking_keys [:lexical_weight, :semantic_weight]
@@ -35,6 +44,7 @@ defmodule Jido.MemoryOS.Config do
     :consolidation_debounce_ms,
     :auto_consolidate
   ]
+  @governance_keys [:policy, :approvals, :audit, :retention, :masking]
 
   @defaults %{
     namespace_template: "agent:%{agent_id}:%{tier}",
@@ -93,6 +103,33 @@ defmodule Jido.MemoryOS.Config do
       dead_letter_limit: 200,
       consolidation_debounce_ms: 150,
       auto_consolidate: true
+    },
+    governance: %{
+      policy: %{
+        default_effect: :deny,
+        allow_same_group: true,
+        rules: []
+      },
+      approvals: %{
+        enabled: true,
+        required_actions: [],
+        ttl_ms: 300_000,
+        max_tokens: 500,
+        one_time: true
+      },
+      audit: %{
+        enabled: true,
+        max_events: 2_000
+      },
+      retention: %{
+        short: %{max_ttl_ms: nil, blocked_tags: [], allowed_classes: []},
+        mid: %{max_ttl_ms: nil, blocked_tags: [], allowed_classes: []},
+        long: %{max_ttl_ms: nil, blocked_tags: [], allowed_classes: []}
+      },
+      masking: %{
+        default_mode: :allow,
+        role_modes: %{admin: :allow}
+      }
     }
   }
 
@@ -108,7 +145,8 @@ defmodule Jido.MemoryOS.Config do
           plugin: map(),
           safety: map(),
           lifecycle: map(),
-          manager: map()
+          manager: map(),
+          governance: map()
         }
 
   @doc """
@@ -159,6 +197,7 @@ defmodule Jido.MemoryOS.Config do
     {safety, errors} = validate_safety(Map.get(root_overrides, :safety), errors)
     {lifecycle, errors} = validate_lifecycle(Map.get(root_overrides, :lifecycle), errors)
     {manager, errors} = validate_manager(Map.get(root_overrides, :manager), errors)
+    {governance, errors} = validate_governance(Map.get(root_overrides, :governance), errors)
 
     if errors == [] do
       {:ok,
@@ -169,7 +208,8 @@ defmodule Jido.MemoryOS.Config do
          plugin: plugin,
          safety: safety,
          lifecycle: lifecycle,
-         manager: manager
+         manager: manager,
+         governance: governance
        }}
     else
       {:error, Enum.reverse(errors)}
@@ -732,6 +772,151 @@ defmodule Jido.MemoryOS.Config do
        consolidation_debounce_ms: consolidation_debounce_ms,
        auto_consolidate: auto_consolidate
      }, errors}
+  end
+
+  @spec validate_governance(term(), [ConfigError.t()]) :: {map(), [ConfigError.t()]}
+  defp validate_governance(value, errors) do
+    path = [:governance]
+    {input, errors} = normalize_section_map(value, path, errors)
+    {normalized, unknown} = normalize_known_keys(input, @governance_keys)
+
+    errors =
+      Enum.reduce(unknown, errors, fn key, acc ->
+        [
+          error(path ++ [to_path_key(key)], :unknown_field, "unknown governance config key", key)
+          | acc
+        ]
+      end)
+
+    merged = deep_merge(@defaults.governance, normalized)
+
+    policy = normalize_section(merged, :policy, @defaults.governance.policy)
+    approvals = normalize_section(merged, :approvals, @defaults.governance.approvals)
+    audit = normalize_section(merged, :audit, @defaults.governance.audit)
+    retention = normalize_retention(map_get(merged, :retention, @defaults.governance.retention))
+    masking = normalize_masking(map_get(merged, :masking, @defaults.governance.masking))
+
+    {%{
+       policy: policy,
+       approvals: approvals,
+       audit: audit,
+       retention: retention,
+       masking: masking
+     }, errors}
+  end
+
+  @spec normalize_section(map(), atom(), map()) :: map()
+  defp normalize_section(input, key, fallback) do
+    case map_get(input, key, fallback) do
+      %{} = section -> deep_merge(fallback, section)
+      _ -> fallback
+    end
+  end
+
+  @spec normalize_retention(term()) :: map()
+  defp normalize_retention(retention) do
+    retention_map =
+      case retention do
+        %{} = map -> map
+        _ -> %{}
+      end
+
+    Enum.reduce([:short, :mid, :long], %{}, fn tier, acc ->
+      fallback = map_get(@defaults.governance.retention, tier, %{})
+      tier_map = normalize_section(retention_map, tier, fallback)
+
+      max_ttl_ms =
+        case map_get(tier_map, :max_ttl_ms) do
+          nil -> nil
+          value when is_integer(value) and value > 0 -> value
+          _ -> nil
+        end
+
+      blocked_tags =
+        case map_get(tier_map, :blocked_tags) do
+          list when is_list(list) -> Enum.filter(list, &is_binary/1)
+          _ -> fallback.blocked_tags
+        end
+
+      allowed_classes =
+        case map_get(tier_map, :allowed_classes) do
+          list when is_list(list) ->
+            list
+            |> Enum.map(fn
+              atom when is_atom(atom) -> atom
+              binary when is_binary(binary) -> String.trim(binary)
+              _ -> nil
+            end)
+            |> Enum.map(fn
+              "" -> nil
+              value -> value
+            end)
+            |> Enum.reject(&is_nil/1)
+            |> Enum.uniq()
+
+          _ ->
+            fallback.allowed_classes
+        end
+
+      Map.put(acc, tier, %{
+        max_ttl_ms: max_ttl_ms,
+        blocked_tags: blocked_tags,
+        allowed_classes: allowed_classes
+      })
+    end)
+  end
+
+  @spec normalize_masking(term()) :: map()
+  defp normalize_masking(masking) do
+    fallback = @defaults.governance.masking
+
+    masking_map =
+      case masking do
+        %{} = map -> map
+        _ -> %{}
+      end
+
+    default_mode =
+      case map_get(masking_map, :default_mode, fallback.default_mode) do
+        mode when mode in [:allow, :mask, :drop] -> mode
+        "allow" -> :allow
+        "mask" -> :mask
+        "drop" -> :drop
+        _ -> fallback.default_mode
+      end
+
+    role_modes =
+      case map_get(masking_map, :role_modes, fallback.role_modes) do
+        %{} = modes ->
+          Enum.reduce(modes, %{}, fn {role, mode}, acc ->
+            key =
+              case role do
+                atom when is_atom(atom) -> atom
+                binary when is_binary(binary) -> String.trim(binary)
+                _ -> nil
+              end
+
+            normalized_mode =
+              case mode do
+                value when value in [:allow, :mask, :drop] -> value
+                "allow" -> :allow
+                "mask" -> :mask
+                "drop" -> :drop
+                _ -> nil
+              end
+
+            if is_nil(key) or key == "" or is_nil(normalized_mode) do
+              acc
+            else
+              Map.put(acc, key, normalized_mode)
+            end
+          end)
+
+        _ ->
+          fallback.role_modes
+      end
+
+    %{default_mode: default_mode, role_modes: role_modes}
   end
 
   @spec validate_store(term(), term(), [atom()], [ConfigError.t()], {module(), keyword()}) ::

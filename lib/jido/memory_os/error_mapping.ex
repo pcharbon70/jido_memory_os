@@ -56,6 +56,60 @@ defmodule Jido.MemoryOS.ErrorMapping do
           details: details(operation, reason, %{code: :not_found})
         )
 
+      {:access_denied, decision} ->
+        Jido.Error.execution_error("memory access denied by policy",
+          phase: :execution,
+          details:
+            details(operation, reason, %{
+              code: :access_denied,
+              policy_reason: Map.get(decision, :reason),
+              policy_effect: Map.get(decision, :effect),
+              matched_rule: Map.get(decision, :matched_rule)
+            })
+        )
+
+      :approval_token_required ->
+        Jido.Error.execution_error("approval token required for operation",
+          phase: :execution,
+          details: details(operation, reason, %{code: :approval_required})
+        )
+
+      :approval_token_invalid ->
+        Jido.Error.execution_error("approval token is invalid",
+          phase: :execution,
+          details: details(operation, reason, %{code: :approval_invalid})
+        )
+
+      :approval_token_expired ->
+        Jido.Error.execution_error("approval token has expired",
+          phase: :execution,
+          details: details(operation, reason, %{code: :approval_expired})
+        )
+
+      :approval_token_actor_mismatch ->
+        Jido.Error.execution_error("approval token actor mismatch",
+          phase: :execution,
+          details: details(operation, reason, %{code: :approval_actor_mismatch})
+        )
+
+      :approval_token_action_not_allowed ->
+        Jido.Error.execution_error("approval token does not allow this action",
+          phase: :execution,
+          details: details(operation, reason, %{code: :approval_action_not_allowed})
+        )
+
+      {:retention_blocked, reason_kind, value} ->
+        Jido.Error.validation_error("memory persistence blocked by retention policy",
+          kind: :input,
+          subject: :retention,
+          details:
+            details(operation, reason, %{
+              code: :retention_blocked,
+              reason_kind: reason_kind,
+              value: value
+            })
+        )
+
       {:missing_runtime_capabilities, module, missing} ->
         Jido.Error.validation_error("jido_memory runtime capabilities are missing",
           kind: :config,
