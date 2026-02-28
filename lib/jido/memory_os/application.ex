@@ -9,7 +9,13 @@ defmodule Jido.MemoryOS.Application do
       children = [
         {Task.Supervisor, name: Jido.MemoryOS.ManagerWorkers},
         {DynamicSupervisor, name: Jido.MemoryOS.MaintenanceSupervisor, strategy: :one_for_one},
-        {Jido.MemoryOS.MemoryManager, app_config: app_config()}
+        {Jido.MemoryOS.MemoryManager, app_config: app_config()},
+        {Jido.MemoryOS.Workers.RetrievalWorker,
+         name: Jido.MemoryOS.Workers.RetrievalWorker, manager: Jido.MemoryOS.MemoryManager},
+        {Jido.MemoryOS.Workers.ConsolidationWorker,
+         name: Jido.MemoryOS.Workers.ConsolidationWorker, manager: Jido.MemoryOS.MemoryManager},
+        {Jido.MemoryOS.Workers.PruneWorker,
+         name: Jido.MemoryOS.Workers.PruneWorker, manager: Jido.MemoryOS.MemoryManager}
       ]
 
       Supervisor.start_link(children, strategy: :one_for_one, name: Jido.MemoryOS.Supervisor)
