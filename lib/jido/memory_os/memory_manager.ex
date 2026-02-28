@@ -1,6 +1,7 @@
 defmodule Jido.MemoryOS.MemoryManager do
   @moduledoc """
-  Phase 2 orchestration process for tiered memory lifecycle.
+  Phase 3 control-plane orchestrator for ingestion, retrieval, consolidation,
+  and maintenance operations.
   """
 
   use GenServer
@@ -9,14 +10,55 @@ defmodule Jido.MemoryOS.MemoryManager do
   alias Jido.MemoryOS.{Config, ErrorMapping, Lifecycle, Metadata}
 
   @type candidate :: {String.t(), String.t()}
+  @type operation :: :remember | :retrieve | :explain_retrieval | :forget | :prune | :consolidate
+
+  @type request :: %{
+          id: String.t(),
+          op: operation(),
+          target: map() | struct(),
+          payload: term(),
+          runtime_opts: keyword(),
+          from: GenServer.from() | nil,
+          agent_key: String.t(),
+          enqueued_at: integer(),
+          deadline_ms: integer(),
+          trace_id: String.t(),
+          internal?: boolean()
+        }
+
+  @type retrieval_feature :: %{
+          lexical: number(),
+          semantic: number(),
+          recency: number(),
+          heat: number(),
+          persona: number(),
+          tier_bias: number(),
+          final_score: number()
+        }
 
   @type state :: %{
           app_config: map(),
+          policy_cache: Config.t(),
           short_candidates: MapSet.t(candidate()),
           long_candidates: MapSet.t(candidate()),
           turn_counters: %{optional(String.t()) => non_neg_integer()},
           consolidation_version: pos_integer(),
-          last_conflicts: [map()]
+          last_conflicts: [map()],
+          queue_by_agent: %{optional(String.t()) => :queue.queue(request())},
+          agent_order: :queue.queue(String.t()),
+          scheduled_agents: MapSet.t(String.t()),
+          queue_depth: non_neg_integer(),
+          processing: boolean(),
+          dead_letters: [map()],
+          metrics: map(),
+          pending_consolidation: %{
+            optional(String.t()) => %{
+              ref: reference(),
+              timer_ref: reference(),
+              target: term(),
+              opts: keyword()
+            }
+          }
         }
 
   @doc false
@@ -33,7 +75,8 @@ defmodule Jido.MemoryOS.MemoryManager do
           {:ok, Jido.Memory.Record.t()} | {:error, term()}
   def remember(target, attrs, opts \\ []) do
     {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
-    GenServer.call(server, {:remember, target, attrs, runtime_opts})
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:remember, target, attrs, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -43,7 +86,8 @@ defmodule Jido.MemoryOS.MemoryManager do
           {:ok, [Jido.Memory.Record.t()]} | {:error, term()}
   def retrieve(target, query, opts \\ []) do
     {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
-    GenServer.call(server, {:retrieve, target, query, runtime_opts})
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:retrieve, target, query, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -52,7 +96,8 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec forget(map() | struct(), String.t(), keyword()) :: {:ok, boolean()} | {:error, term()}
   def forget(target, id, opts \\ []) do
     {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
-    GenServer.call(server, {:forget, target, id, runtime_opts})
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:forget, target, id, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -61,7 +106,8 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec prune(map() | struct(), keyword()) :: {:ok, non_neg_integer()} | {:error, term()}
   def prune(target, opts \\ []) do
     {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
-    GenServer.call(server, {:prune, target, runtime_opts})
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:prune, target, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -70,7 +116,8 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec consolidate(map() | struct(), keyword()) :: {:ok, map()} | {:error, term()}
   def consolidate(target, opts \\ []) do
     {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
-    GenServer.call(server, {:consolidate, target, runtime_opts}, :infinity)
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:consolidate, target, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -79,22 +126,9 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec explain_retrieval(map() | struct(), map() | keyword() | Jido.Memory.Query.t(), keyword()) ::
           {:ok, map()} | {:error, term()}
   def explain_retrieval(target, query, opts \\ []) do
-    server = Keyword.get(opts, :server, __MODULE__)
-
-    with {:ok, records} <- retrieve(target, query, opts),
-         {:ok, config} <- current_config(server),
-         {:ok, conflicts} <- last_conflicts(server) do
-      {:ok,
-       %{
-         query: query,
-         result_count: length(records),
-         retrieval: config.retrieval,
-         tier: Keyword.get(opts, :tier, :short),
-         lifecycle: config.lifecycle,
-         records: Enum.map(records, &record_debug/1),
-         recent_conflicts: conflicts
-       }}
-    end
+    {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:explain_retrieval, target, query, runtime_opts}, call_timeout)
   end
 
   @doc """
@@ -113,66 +147,101 @@ defmodule Jido.MemoryOS.MemoryManager do
     GenServer.call(server, :last_conflicts)
   end
 
+  @doc """
+  Returns dead-lettered ingestion entries.
+  """
+  @spec dead_letters(GenServer.server()) :: {:ok, [map()]}
+  def dead_letters(server \\ __MODULE__) do
+    GenServer.call(server, :dead_letters)
+  end
+
+  @doc """
+  Returns manager queue/operation metrics.
+  """
+  @spec metrics(GenServer.server()) :: {:ok, map()}
+  def metrics(server \\ __MODULE__) do
+    GenServer.call(server, :metrics)
+  end
+
+  @doc """
+  Cancels queued requests for one agent and optional operation.
+  """
+  @spec cancel_pending(GenServer.server(), keyword()) :: {:ok, non_neg_integer()}
+  def cancel_pending(server \\ __MODULE__, opts \\ []) do
+    GenServer.call(server, {:cancel_pending, opts})
+  end
+
   @impl true
   def init(opts) do
     app_config = Keyword.get(opts, :app_config, Config.app_config())
 
-    {:ok,
-     %{
-       app_config: app_config,
-       short_candidates: MapSet.new(),
-       long_candidates: MapSet.new(),
-       turn_counters: %{},
-       consolidation_version: 1,
-       last_conflicts: []
-     }}
-  end
-
-  @impl true
-  def handle_call({:remember, target, attrs, runtime_opts}, _from, state) do
-    runtime_opts = with_app_config(runtime_opts, state)
-
-    case normalize_tier(Keyword.get(runtime_opts, :tier, :short)) do
-      {:ok, :short} ->
-        {result, new_state} = remember_short(target, attrs, runtime_opts, state)
-        {:reply, result, new_state}
-
-      {:ok, _tier} ->
-        {:reply, MemoryRuntime.remember(target, attrs, runtime_opts), state}
+    case Config.validate(app_config) do
+      {:ok, config} ->
+        {:ok,
+         %{
+           app_config: app_config,
+           policy_cache: config,
+           short_candidates: MapSet.new(),
+           long_candidates: MapSet.new(),
+           turn_counters: %{},
+           consolidation_version: 1,
+           last_conflicts: [],
+           queue_by_agent: %{},
+           agent_order: :queue.new(),
+           scheduled_agents: MapSet.new(),
+           queue_depth: 0,
+           processing: false,
+           dead_letters: [],
+           metrics: %{
+             queued: 0,
+             processed: 0,
+             timed_out: 0,
+             overloaded: 0,
+             retried: 0,
+             dead_lettered: 0,
+             cancelled: 0
+           },
+           pending_consolidation: %{}
+         }}
 
       {:error, reason} ->
-        {:reply, {:error, ErrorMapping.from_reason(reason, :remember)}, state}
+        {:stop, ErrorMapping.from_reason(reason, :init)}
     end
   end
 
   @impl true
-  def handle_call({:retrieve, target, query, runtime_opts}, _from, state) do
-    result = MemoryRuntime.recall(target, query, with_app_config(runtime_opts, state))
-    {:reply, result, state}
+  def handle_call({:remember, target, attrs, runtime_opts}, from, state) do
+    enqueue_reply_request(:remember, target, attrs, runtime_opts, from, state)
   end
 
   @impl true
-  def handle_call({:forget, target, id, runtime_opts}, _from, state) do
-    result = MemoryRuntime.forget(target, id, with_app_config(runtime_opts, state))
-    {:reply, result, state}
+  def handle_call({:retrieve, target, query, runtime_opts}, from, state) do
+    enqueue_reply_request(:retrieve, target, query, runtime_opts, from, state)
   end
 
   @impl true
-  def handle_call({:prune, target, runtime_opts}, _from, state) do
-    result = MemoryRuntime.prune(target, with_app_config(runtime_opts, state))
-    {:reply, result, state}
+  def handle_call({:explain_retrieval, target, query, runtime_opts}, from, state) do
+    enqueue_reply_request(:explain_retrieval, target, query, runtime_opts, from, state)
   end
 
   @impl true
-  def handle_call({:consolidate, target, runtime_opts}, _from, state) do
-    runtime_opts = with_app_config(runtime_opts, state)
-    {result, new_state} = run_consolidation(target, runtime_opts, state)
-    {:reply, result, new_state}
+  def handle_call({:forget, target, id, runtime_opts}, from, state) do
+    enqueue_reply_request(:forget, target, id, runtime_opts, from, state)
+  end
+
+  @impl true
+  def handle_call({:prune, target, runtime_opts}, from, state) do
+    enqueue_reply_request(:prune, target, :none, runtime_opts, from, state)
+  end
+
+  @impl true
+  def handle_call({:consolidate, target, runtime_opts}, from, state) do
+    enqueue_reply_request(:consolidate, target, :none, runtime_opts, from, state)
   end
 
   @impl true
   def handle_call(:current_config, _from, state) do
-    {:reply, Config.validate(state.app_config), state}
+    {:reply, {:ok, state.policy_cache}, state}
   end
 
   @impl true
@@ -180,9 +249,745 @@ defmodule Jido.MemoryOS.MemoryManager do
     {:reply, {:ok, state.last_conflicts}, state}
   end
 
-  @spec remember_short(map() | struct(), map() | keyword(), keyword(), state()) ::
+  @impl true
+  def handle_call(:dead_letters, _from, state) do
+    {:reply, {:ok, state.dead_letters}, state}
+  end
+
+  @impl true
+  def handle_call(:metrics, _from, state) do
+    queue_metrics = %{
+      queue_depth: state.queue_depth,
+      pending_agents: map_size(state.queue_by_agent)
+    }
+
+    {:reply, {:ok, Map.merge(state.metrics, queue_metrics)}, state}
+  end
+
+  @impl true
+  def handle_call({:cancel_pending, opts}, _from, state) do
+    agent_filter =
+      normalize_agent_key(Keyword.get(opts, :agent_id) || Keyword.get(opts, :agent_key))
+
+    op_filter =
+      case Keyword.get(opts, :operation) do
+        nil ->
+          :any
+
+        op when op in [:remember, :retrieve, :explain_retrieval, :forget, :prune, :consolidate] ->
+          op
+
+        _ ->
+          :any
+      end
+
+    {cancelled_requests, new_state} = cancel_matching_requests(state, agent_filter, op_filter)
+
+    Enum.each(cancelled_requests, fn request ->
+      if request.from do
+        GenServer.reply(
+          request.from,
+          {:error,
+           Jido.Error.execution_error("request cancelled",
+             phase: :execution,
+             details: %{code: :cancelled, operation: request.op, trace_id: request.trace_id}
+           )}
+        )
+      end
+    end)
+
+    cancelled_count = length(cancelled_requests)
+
+    {:reply, {:ok, cancelled_count}, increment_metric(new_state, :cancelled, cancelled_count)}
+  end
+
+  @impl true
+  def handle_info(:drain_queue, %{processing: true} = state), do: {:noreply, state}
+
+  @impl true
+  def handle_info(:drain_queue, state) do
+    case dequeue_next_request(state) do
+      {:empty, state1} ->
+        {:noreply, %{state1 | processing: false}}
+
+      {:ok, request, state1} ->
+        state2 = %{state1 | processing: true}
+
+        {result, state3} = execute_request(request, state2)
+
+        state4 =
+          state3
+          |> maybe_reply(request.from, result)
+          |> increment_metric(:processed)
+          |> Map.put(:processing, false)
+
+        if state4.queue_depth > 0 do
+          send(self(), :drain_queue)
+        end
+
+        {:noreply, state4}
+    end
+  end
+
+  @impl true
+  def handle_info({:auto_consolidate, namespace, ref}, state) do
+    case Map.get(state.pending_consolidation, namespace) do
+      %{ref: ^ref, target: target, opts: opts} ->
+        state1 = %{
+          state
+          | pending_consolidation: Map.delete(state.pending_consolidation, namespace)
+        }
+
+        case enqueue_request(:consolidate, target, :none, opts, nil, state1, internal?: true) do
+          {:ok, state2} ->
+            send(self(), :drain_queue)
+            {:noreply, state2}
+
+          {:error, _reason, state2} ->
+            {:noreply, state2}
+        end
+
+      _ ->
+        {:noreply, state}
+    end
+  end
+
+  @spec enqueue_reply_request(
+          operation(),
+          map() | struct(),
+          term(),
+          keyword(),
+          GenServer.from(),
+          state()
+        ) ::
+          {:noreply, state()} | {:reply, term(), state()}
+  defp enqueue_reply_request(op, target, payload, runtime_opts, from, state) do
+    runtime_opts = with_app_config(runtime_opts, state)
+
+    case enqueue_request(op, target, payload, runtime_opts, from, state) do
+      {:ok, state1} ->
+        send(self(), :drain_queue)
+        {:noreply, state1}
+
+      {:error, reason, state1} ->
+        {:reply, {:error, reason}, state1}
+    end
+  end
+
+  @spec enqueue_request(
+          operation(),
+          map() | struct(),
+          term(),
+          keyword(),
+          GenServer.from() | nil,
+          state(),
+          keyword()
+        ) ::
+          {:ok, state()} | {:error, term(), state()}
+  defp enqueue_request(op, target, payload, runtime_opts, from, state, opts \\ []) do
+    now = System.system_time(:millisecond)
+
+    timeout_ms =
+      normalize_timeout(
+        Keyword.get(runtime_opts, :timeout_ms),
+        state.policy_cache.manager.request_timeout_ms
+      )
+
+    trace_id = normalize_trace_id(Keyword.get(runtime_opts, :correlation_id))
+    agent_key = request_agent_key(target, runtime_opts)
+    internal? = Keyword.get(opts, :internal?, false)
+
+    request = %{
+      id: "rq-" <> Integer.to_string(System.unique_integer([:positive, :monotonic])),
+      op: op,
+      target: target,
+      payload: payload,
+      runtime_opts: runtime_opts,
+      from: from,
+      agent_key: agent_key,
+      enqueued_at: now,
+      deadline_ms: now + timeout_ms,
+      trace_id: trace_id,
+      internal?: internal?
+    }
+
+    with :ok <- ensure_queue_capacity(state, agent_key, internal?, trace_id) do
+      {:ok,
+       state
+       |> put_request_in_queue(agent_key, request)
+       |> increment_metric(:queued)}
+    else
+      {:error, overload} ->
+        {:error, overload, increment_metric(state, :overloaded)}
+    end
+  end
+
+  @spec ensure_queue_capacity(state(), String.t(), boolean(), String.t()) ::
+          :ok | {:error, term()}
+  defp ensure_queue_capacity(_state, _agent_key, true, _trace_id), do: :ok
+
+  defp ensure_queue_capacity(state, agent_key, false, trace_id) do
+    manager_cfg = state.policy_cache.manager
+    queue_depth = state.queue_depth
+    agent_depth = state.queue_by_agent |> Map.get(agent_key, :queue.new()) |> :queue.len()
+
+    cond do
+      queue_depth >= manager_cfg.queue_max_depth ->
+        {:error,
+         Jido.Error.execution_error("memory manager queue overloaded",
+           phase: :execution,
+           details: %{
+             code: :manager_overloaded,
+             queue_depth: queue_depth,
+             queue_max_depth: manager_cfg.queue_max_depth,
+             retry_after_ms: max(50, div(manager_cfg.request_timeout_ms, 4)),
+             trace_id: trace_id
+           }
+         )}
+
+      agent_depth >= manager_cfg.queue_per_agent ->
+        {:error,
+         Jido.Error.execution_error("memory manager per-agent queue limit reached",
+           phase: :execution,
+           details: %{
+             code: :manager_agent_overloaded,
+             agent_key: agent_key,
+             agent_queue_depth: agent_depth,
+             queue_per_agent: manager_cfg.queue_per_agent,
+             retry_after_ms: max(50, div(manager_cfg.request_timeout_ms, 4)),
+             trace_id: trace_id
+           }
+         )}
+
+      true ->
+        :ok
+    end
+  end
+
+  @spec put_request_in_queue(state(), String.t(), request()) :: state()
+  defp put_request_in_queue(state, agent_key, request) do
+    agent_queue = Map.get(state.queue_by_agent, agent_key, :queue.new())
+    was_empty? = :queue.is_empty(agent_queue)
+    updated_queue = :queue.in(request, agent_queue)
+
+    {agent_order, scheduled_agents} =
+      if was_empty? and not MapSet.member?(state.scheduled_agents, agent_key) do
+        {:queue.in(agent_key, state.agent_order), MapSet.put(state.scheduled_agents, agent_key)}
+      else
+        {state.agent_order, state.scheduled_agents}
+      end
+
+    %{
+      state
+      | queue_by_agent: Map.put(state.queue_by_agent, agent_key, updated_queue),
+        agent_order: agent_order,
+        scheduled_agents: scheduled_agents,
+        queue_depth: state.queue_depth + 1
+    }
+  end
+
+  @spec dequeue_next_request(state()) :: {:empty, state()} | {:ok, request(), state()}
+  defp dequeue_next_request(state) do
+    case :queue.out(state.agent_order) do
+      {:empty, _} ->
+        {:empty, state}
+
+      {{:value, agent_key}, rest_order} ->
+        case Map.get(state.queue_by_agent, agent_key, :queue.new()) |> :queue.out() do
+          {:empty, _} ->
+            state1 = %{
+              state
+              | queue_by_agent: Map.delete(state.queue_by_agent, agent_key),
+                agent_order: rest_order,
+                scheduled_agents: MapSet.delete(state.scheduled_agents, agent_key)
+            }
+
+            dequeue_next_request(state1)
+
+          {{:value, request}, remaining_agent_queue} ->
+            {queue_by_agent, agent_order, scheduled_agents} =
+              if :queue.is_empty(remaining_agent_queue) do
+                {
+                  Map.delete(state.queue_by_agent, agent_key),
+                  rest_order,
+                  MapSet.delete(state.scheduled_agents, agent_key)
+                }
+              else
+                {
+                  Map.put(state.queue_by_agent, agent_key, remaining_agent_queue),
+                  :queue.in(agent_key, rest_order),
+                  state.scheduled_agents
+                }
+              end
+
+            {:ok, request,
+             %{
+               state
+               | queue_by_agent: queue_by_agent,
+                 agent_order: agent_order,
+                 scheduled_agents: scheduled_agents,
+                 queue_depth: max(0, state.queue_depth - 1)
+             }}
+        end
+    end
+  end
+
+  @spec cancel_matching_requests(state(), String.t() | :any, operation() | :any) ::
+          {[request()], state()}
+  defp cancel_matching_requests(state, agent_filter, op_filter) do
+    Enum.reduce(state.queue_by_agent, {[], %{state | queue_by_agent: %{}, queue_depth: 0}}, fn
+      {agent_key, queue}, {cancelled, acc_state} ->
+        {keep_queue, drop_requests} =
+          split_queue(queue, fn request ->
+            cancel_match?(request, agent_filter, op_filter, agent_key)
+          end)
+
+        acc_state =
+          if :queue.is_empty(keep_queue) do
+            acc_state
+          else
+            put_queue_without_limit(acc_state, agent_key, keep_queue)
+          end
+
+        {drop_requests ++ cancelled, acc_state}
+    end)
+    |> then(fn {cancelled, acc_state} ->
+      rebuilt_order =
+        acc_state.queue_by_agent
+        |> Map.keys()
+        |> Enum.reduce(:queue.new(), fn key, q -> :queue.in(key, q) end)
+
+      {
+        cancelled,
+        %{
+          acc_state
+          | agent_order: rebuilt_order,
+            scheduled_agents: MapSet.new(Map.keys(acc_state.queue_by_agent))
+        }
+      }
+    end)
+  end
+
+  @spec split_queue(:queue.queue(request()), (request() -> boolean())) ::
+          {:queue.queue(request()), [request()]}
+  defp split_queue(queue, predicate) do
+    queue
+    |> :queue.to_list()
+    |> Enum.reduce({:queue.new(), []}, fn request, {keep, drop} ->
+      if predicate.(request) do
+        {keep, [request | drop]}
+      else
+        {:queue.in(request, keep), drop}
+      end
+    end)
+    |> then(fn {keep, drop} -> {keep, Enum.reverse(drop)} end)
+  end
+
+  @spec put_queue_without_limit(state(), String.t(), :queue.queue(request())) :: state()
+  defp put_queue_without_limit(state, agent_key, queue) do
+    %{
+      state
+      | queue_by_agent: Map.put(state.queue_by_agent, agent_key, queue),
+        queue_depth: state.queue_depth + :queue.len(queue)
+    }
+  end
+
+  @spec cancel_match?(request(), String.t() | :any, operation() | :any, String.t()) :: boolean()
+  defp cancel_match?(_request, :any, :any, _agent_key), do: true
+
+  defp cancel_match?(request, agent_filter, op_filter, agent_key) do
+    agent_ok = agent_filter == :any or agent_filter == agent_key
+    op_ok = op_filter == :any or op_filter == request.op
+    agent_ok and op_ok
+  end
+
+  @spec execute_request(request(), state()) :: {term(), state()}
+  defp execute_request(request, state) do
+    now = System.system_time(:millisecond)
+
+    if now > request.deadline_ms do
+      timeout_result(request, state)
+    else
+      sleep_ms =
+        max(0, normalize_integer(Keyword.get(request.runtime_opts, :operation_sleep_ms), 0))
+
+      if sleep_ms > 0, do: Process.sleep(sleep_ms)
+
+      if System.system_time(:millisecond) > request.deadline_ms do
+        timeout_result(request, state)
+      else
+        case request.op do
+          :remember -> remember_request(request, state)
+          :retrieve -> retrieve_request(request, state, false)
+          :explain_retrieval -> retrieve_request(request, state, true)
+          :forget -> forget_request(request, state)
+          :prune -> prune_request(request, state)
+          :consolidate -> consolidate_request(request, state)
+        end
+      end
+    end
+  end
+
+  @spec timeout_result(request(), state()) :: {term(), state()}
+  defp timeout_result(request, state) do
+    timeout = max(0, request.deadline_ms - request.enqueued_at)
+
+    result =
+      {:error,
+       Jido.Error.timeout_error("memory manager request timed out",
+         timeout: timeout,
+         details: %{code: :manager_timeout, operation: request.op, trace_id: request.trace_id}
+       )}
+
+    {result, increment_metric(state, :timed_out)}
+  end
+
+  @spec remember_request(request(), state()) :: {term(), state()}
+  defp remember_request(request, state) do
+    runtime_opts = request.runtime_opts
+
+    case normalize_tier(Keyword.get(runtime_opts, :tier, :short)) do
+      {:ok, :short} ->
+        {result, state1} =
+          remember_short(request.target, request.payload, runtime_opts, state, request.trace_id)
+
+        {result, state1}
+
+      {:ok, _tier} ->
+        result =
+          retry_runtime_remember(
+            request.target,
+            request.payload,
+            runtime_opts,
+            state,
+            :remember,
+            request.trace_id
+          )
+
+        case result do
+          {{:ok, record}, state1} -> {{:ok, record}, state1}
+          {{:error, reason}, state1} -> {{:error, to_jido_error(reason, :remember)}, state1}
+        end
+
+      {:error, reason} ->
+        {{:error, ErrorMapping.from_reason(reason, :remember)}, state}
+    end
+  end
+
+  @spec retrieve_request(request(), state(), boolean()) :: {term(), state()}
+  defp retrieve_request(request, state, explain?) do
+    with {:ok, query_map} <- to_query_map(request.payload),
+         {:ok, retrieval} <-
+           run_retrieval_pipeline(request.target, query_map, request.runtime_opts, state) do
+      if explain? do
+        {:ok,
+         %{
+           query: query_map,
+           result_count: length(retrieval.records),
+           retrieval: state.policy_cache.retrieval,
+           lifecycle: state.policy_cache.lifecycle,
+           manager: state.policy_cache.manager,
+           tier_mode: retrieval.tier_mode,
+           queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
+           records: Enum.map(retrieval.records, &record_debug/1),
+           scored_candidates: retrieval.scored_candidates,
+           excluded: retrieval.excluded,
+           selection_rationale: retrieval.selection_rationale,
+           recent_conflicts: state.last_conflicts
+         }}
+        |> then(&{&1, state})
+      else
+        {{:ok, retrieval.records}, state}
+      end
+    else
+      {:error, reason} ->
+        {{:error, to_jido_error(reason, if(explain?, do: :explain_retrieval, else: :retrieve))},
+         state}
+    end
+  end
+
+  @spec forget_request(request(), state()) :: {term(), state()}
+  defp forget_request(request, state) do
+    result = MemoryRuntime.forget(request.target, request.payload, request.runtime_opts)
+    {result, state}
+  end
+
+  @spec prune_request(request(), state()) :: {term(), state()}
+  defp prune_request(request, state) do
+    result = MemoryRuntime.prune(request.target, request.runtime_opts)
+    {result, state}
+  end
+
+  @spec consolidate_request(request(), state()) :: {term(), state()}
+  defp consolidate_request(request, state) do
+    {result, state1} = run_consolidation(request.target, request.runtime_opts, state)
+    {result, state1}
+  end
+
+  @spec run_retrieval_pipeline(map() | struct(), map(), keyword(), state()) ::
+          {:ok, map()} | {:error, term()}
+  defp run_retrieval_pipeline(target, query_map, runtime_opts, state) do
+    tier_mode = resolve_tier_mode(query_map, runtime_opts)
+    tiers = mode_tiers(tier_mode)
+
+    limit =
+      normalize_integer(
+        map_get(query_map, :limit, state.policy_cache.retrieval.limit),
+        state.policy_cache.retrieval.limit
+      )
+
+    now = System.system_time(:millisecond)
+
+    base_query =
+      query_map
+      |> Map.drop([
+        :tier_mode,
+        "tier_mode",
+        :persona_keys,
+        "persona_keys",
+        :debug,
+        "debug",
+        :include_excluded,
+        "include_excluded"
+      ])
+      |> Map.put(:limit, max(limit * max(length(tiers), 1), limit))
+
+    with {:ok, fetched} <- fetch_tier_candidates(target, base_query, runtime_opts, tiers),
+         {:ok, ranked} <- rank_candidates(fetched, query_map, state.policy_cache.retrieval, now) do
+      selected = ranked |> Enum.take(limit)
+      selected_keys = MapSet.new(Enum.map(selected, &candidate_key(&1.record)))
+
+      excluded =
+        ranked
+        |> Enum.reject(&(candidate_key(&1.record) in selected_keys))
+        |> Enum.map(fn candidate ->
+          %{
+            id: candidate.record.id,
+            namespace: candidate.record.namespace,
+            tier: candidate.tier,
+            reason: :below_rank_limit,
+            final_score: candidate.features.final_score
+          }
+        end)
+
+      {:ok,
+       %{
+         records: Enum.map(selected, & &1.record),
+         tier_mode: tier_mode,
+         scored_candidates:
+           Enum.map(selected, fn candidate ->
+             %{
+               id: candidate.record.id,
+               namespace: candidate.record.namespace,
+               tier: candidate.tier,
+               features: candidate.features,
+               include_reason: :selected
+             }
+           end),
+         excluded: excluded,
+         selection_rationale: %{
+           tie_breaker: "final_score desc, observed_at desc, id asc",
+           weights: %{
+             lexical: state.policy_cache.retrieval.ranking.lexical_weight,
+             semantic: state.policy_cache.retrieval.ranking.semantic_weight,
+             recency_bonus: 0.15,
+             tier_bias: 0.1
+           }
+         }
+       }}
+    end
+  end
+
+  @spec fetch_tier_candidates(map() | struct(), map(), keyword(), [Config.tier()]) ::
+          {:ok, [map()]} | {:error, term()}
+  defp fetch_tier_candidates(target, query_map, runtime_opts, tiers) do
+    tiers
+    |> Enum.reduce_while({:ok, []}, fn tier, {:ok, acc} ->
+      tier_opts = Keyword.put(runtime_opts, :tier, tier)
+
+      case MemoryRuntime.recall(target, query_map, tier_opts) do
+        {:ok, records} ->
+          tagged = Enum.map(records, &%{tier: tier, record: &1})
+          {:cont, {:ok, tagged ++ acc}}
+
+        {:error, reason} ->
+          {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, tagged} -> {:ok, dedupe_candidates(tagged)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  @spec dedupe_candidates([map()]) :: [map()]
+  defp dedupe_candidates(candidates) do
+    candidates
+    |> Enum.reduce(%{}, fn candidate, acc ->
+      key = candidate_key(candidate.record)
+
+      Map.update(acc, key, candidate, fn existing ->
+        if tier_priority(candidate.tier) >= tier_priority(existing.tier) do
+          candidate
+        else
+          existing
+        end
+      end)
+    end)
+    |> Map.values()
+  end
+
+  @spec rank_candidates([map()], map(), map(), integer()) :: {:ok, [map()]} | {:error, term()}
+  defp rank_candidates(candidates, query_map, retrieval_cfg, now) do
+    persona_keys = normalize_tags(map_get(query_map, :persona_keys, []))
+    text_filter = map_get(query_map, :text_contains)
+
+    ranked =
+      candidates
+      |> Enum.map(fn %{record: record, tier: tier} = candidate ->
+        heat = heat_component(record)
+        persona = persona_component(record, persona_keys)
+        semantic = Float.round(0.7 * heat + 0.3 * persona, 4)
+        lexical = lexical_component(record, text_filter)
+        recency = recency_component(record, now)
+        tier_bias = tier_bias(tier)
+
+        final_score =
+          Float.round(
+            retrieval_cfg.ranking.lexical_weight * lexical +
+              retrieval_cfg.ranking.semantic_weight * semantic +
+              0.15 * recency + tier_bias,
+            4
+          )
+
+        features = %{
+          lexical: lexical,
+          semantic: semantic,
+          recency: recency,
+          heat: heat,
+          persona: persona,
+          tier_bias: tier_bias,
+          final_score: final_score
+        }
+
+        Map.put(candidate, :features, features)
+      end)
+      |> Enum.sort(fn left, right ->
+        cond do
+          left.features.final_score > right.features.final_score ->
+            true
+
+          left.features.final_score < right.features.final_score ->
+            false
+
+          (left.record.observed_at || 0) > (right.record.observed_at || 0) ->
+            true
+
+          (left.record.observed_at || 0) < (right.record.observed_at || 0) ->
+            false
+
+          true ->
+            left.record.id <= right.record.id
+        end
+      end)
+
+    {:ok, ranked}
+  end
+
+  @spec resolve_tier_mode(map(), keyword()) :: atom()
+  defp resolve_tier_mode(query_map, runtime_opts) do
+    mode =
+      map_get(query_map, :tier_mode) ||
+        Keyword.get(runtime_opts, :tier_mode) ||
+        Keyword.get(runtime_opts, :tier, :short)
+
+    case mode do
+      :short -> :short
+      :mid -> :mid
+      :long -> :long
+      :hybrid -> :hybrid
+      :all -> :all
+      "short" -> :short
+      "mid" -> :mid
+      "long" -> :long
+      "hybrid" -> :hybrid
+      "all" -> :all
+      _ -> :short
+    end
+  end
+
+  @spec mode_tiers(atom()) :: [Config.tier()]
+  defp mode_tiers(:short), do: [:short]
+  defp mode_tiers(:mid), do: [:mid]
+  defp mode_tiers(:long), do: [:long]
+  defp mode_tiers(:hybrid), do: [:short, :mid, :long]
+  defp mode_tiers(:all), do: [:short, :mid, :long]
+
+  @spec tier_priority(Config.tier()) :: integer()
+  defp tier_priority(:short), do: 3
+  defp tier_priority(:mid), do: 2
+  defp tier_priority(:long), do: 1
+
+  @spec tier_bias(Config.tier()) :: number()
+  defp tier_bias(:short), do: 0.1
+  defp tier_bias(:mid), do: 0.05
+  defp tier_bias(:long), do: 0.0
+
+  @spec candidate_key(Jido.Memory.Record.t()) :: {String.t(), String.t()}
+  defp candidate_key(record), do: {record.namespace, record.id}
+
+  @spec recency_component(Jido.Memory.Record.t(), integer()) :: number()
+  defp recency_component(record, now) do
+    age = max(0, now - (record.observed_at || now))
+    clamp(1.0 - age / 86_400_000, 0.0, 1.0)
+  end
+
+  @spec heat_component(Jido.Memory.Record.t()) :: number()
+  defp heat_component(record) do
+    case Metadata.from_record(record) do
+      {:ok, mem_os} -> clamp(mem_os.heat, 0.0, 1.0)
+      _ -> 0.0
+    end
+  end
+
+  @spec persona_component(Jido.Memory.Record.t(), [String.t()]) :: number()
+  defp persona_component(_record, []), do: 0.5
+
+  defp persona_component(record, persona_keys) do
+    case Metadata.from_record(record) do
+      {:ok, mem_os} ->
+        if Enum.any?(mem_os.persona_keys, &(&1 in persona_keys)), do: 1.0, else: 0.0
+
+      _ ->
+        0.0
+    end
+  end
+
+  @spec lexical_component(Jido.Memory.Record.t(), term()) :: number()
+  defp lexical_component(_record, nil), do: 1.0
+
+  defp lexical_component(record, text_filter) when is_binary(text_filter) do
+    haystack =
+      cond do
+        is_binary(record.text) and record.text != "" -> record.text
+        true -> inspect(record.content)
+      end
+
+    if String.contains?(String.downcase(haystack), String.downcase(String.trim(text_filter))),
+      do: 1.0,
+      else: 0.0
+  end
+
+  defp lexical_component(_record, _text_filter), do: 1.0
+
+  @spec clamp(number(), number(), number()) :: number()
+  defp clamp(value, min_value, _max_value) when value < min_value, do: min_value
+  defp clamp(value, _min_value, max_value) when value > max_value, do: max_value
+  defp clamp(value, _min_value, _max_value), do: value
+
+  @spec remember_short(map() | struct(), map() | keyword(), keyword(), state(), String.t()) ::
           {{:ok, Jido.Memory.Record.t()} | {:error, term()}, state()}
-  defp remember_short(target, attrs, runtime_opts, state) do
+  defp remember_short(target, attrs, runtime_opts, state, trace_id) do
     now = System.system_time(:millisecond)
 
     with {:ok, context} <- MemoryRuntime.resolve_context(target, runtime_opts) do
@@ -198,22 +1003,176 @@ defmodule Jido.MemoryOS.MemoryManager do
         |> Keyword.put(:tier, :short)
         |> Keyword.put(:mem_os, mem_os_updates)
 
-      case MemoryRuntime.remember(target, attrs_with_ingest, remember_opts) do
-        {:ok, record} ->
+      case retry_runtime_remember(
+             target,
+             attrs_with_ingest,
+             remember_opts,
+             state,
+             :remember,
+             trace_id
+           ) do
+        {{:ok, record}, state1} ->
           updated_state =
-            state
+            state1
             |> put_turn_counter(context.namespace, normalized.next_turn_index)
             |> enqueue_short_candidate(context.namespace, record.id)
             |> enforce_short_maintenance(target, runtime_opts, context)
+            |> maybe_schedule_auto_consolidation(context.namespace, target, runtime_opts)
 
           {{:ok, record}, updated_state}
 
-        {:error, reason} ->
-          {{:error, to_jido_error(reason, :remember)}, state}
+        {{:error, reason}, state1} ->
+          dead_letter = %{
+            at: now,
+            trace_id: trace_id,
+            operation: :remember,
+            target: summarize_target(target),
+            attrs: attrs_with_ingest,
+            reason: inspect(reason)
+          }
+
+          state2 = push_dead_letter(state1, dead_letter)
+          {{:error, to_jido_error(reason, :remember)}, state2}
       end
     else
       {:error, reason} ->
         {{:error, to_jido_error(reason, :remember)}, state}
+    end
+  end
+
+  @spec retry_runtime_remember(
+          map() | struct(),
+          map() | keyword(),
+          keyword(),
+          state(),
+          atom(),
+          String.t()
+        ) ::
+          {{:ok, Jido.Memory.Record.t()} | {:error, term()}, state()}
+  defp retry_runtime_remember(target, attrs, opts, state, operation, trace_id) do
+    retries = state.policy_cache.manager.retry_attempts
+    backoff_ms = state.policy_cache.manager.retry_backoff_ms
+    jitter_ms = state.policy_cache.manager.retry_jitter_ms
+
+    do_retry_runtime_remember(
+      target,
+      attrs,
+      opts,
+      operation,
+      trace_id,
+      retries + 1,
+      backoff_ms,
+      jitter_ms,
+      state
+    )
+  end
+
+  @spec do_retry_runtime_remember(
+          map() | struct(),
+          map() | keyword(),
+          keyword(),
+          atom(),
+          String.t(),
+          pos_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          state()
+        ) :: {{:ok, Jido.Memory.Record.t()} | {:error, term()}, state()}
+  defp do_retry_runtime_remember(
+         target,
+         attrs,
+         opts,
+         operation,
+         trace_id,
+         attempts_left,
+         backoff_ms,
+         jitter_ms,
+         state
+       ) do
+    case MemoryRuntime.remember(target, attrs, opts) do
+      {:ok, record} ->
+        {{:ok, record}, state}
+
+      {:error, reason} when attempts_left > 1 ->
+        if transient_runtime_error?(reason) do
+          sleep_ms = backoff_ms + random_jitter(jitter_ms)
+          if sleep_ms > 0, do: Process.sleep(sleep_ms)
+
+          state1 = increment_metric(state, :retried)
+
+          do_retry_runtime_remember(
+            target,
+            attrs,
+            opts,
+            operation,
+            trace_id,
+            attempts_left - 1,
+            backoff_ms,
+            jitter_ms,
+            state1
+          )
+        else
+          {{:error, reason}, state}
+        end
+
+      {:error, reason} ->
+        {{:error, enrich_retry_context(reason, operation, trace_id)}, state}
+    end
+  end
+
+  @spec transient_runtime_error?(term()) :: boolean()
+  defp transient_runtime_error?(%Jido.Error.ExecutionError{details: details})
+       when is_map(details) do
+    Map.get(details, :code) in [:upstream_error, :upstream_error_list, :runtime_exception]
+  end
+
+  defp transient_runtime_error?({:runtime_exception, _exception, _stacktrace}), do: true
+  defp transient_runtime_error?({:put_failed, _reason}), do: true
+  defp transient_runtime_error?({:query_failed, _reason}), do: true
+  defp transient_runtime_error?(_), do: false
+
+  @spec enrich_retry_context(term(), atom(), String.t()) :: term()
+  defp enrich_retry_context(%Jido.Error.ExecutionError{} = error, _operation, trace_id) do
+    details = Map.put(error.details || %{}, :trace_id, trace_id)
+    %{error | details: details}
+  end
+
+  defp enrich_retry_context(reason, operation, trace_id) do
+    ErrorMapping.from_reason(reason, operation)
+    |> Map.update!(:details, &Map.put(&1, :trace_id, trace_id))
+  end
+
+  @spec random_jitter(non_neg_integer()) :: non_neg_integer()
+  defp random_jitter(0), do: 0
+  defp random_jitter(max_value) when max_value > 0, do: :rand.uniform(max_value) - 1
+
+  @spec maybe_schedule_auto_consolidation(state(), String.t(), map() | struct(), keyword()) ::
+          state()
+  defp maybe_schedule_auto_consolidation(state, namespace, target, runtime_opts) do
+    if state.policy_cache.manager.auto_consolidate do
+      debounce_ms = state.policy_cache.manager.consolidation_debounce_ms
+
+      if existing = Map.get(state.pending_consolidation, namespace) do
+        Process.cancel_timer(existing.timer_ref)
+      end
+
+      dispatch_ref = make_ref()
+
+      timer_ref =
+        Process.send_after(self(), {:auto_consolidate, namespace, dispatch_ref}, debounce_ms)
+
+      pending =
+        Map.put(state.pending_consolidation, namespace, %{
+          ref: dispatch_ref,
+          timer_ref: timer_ref,
+          target: target,
+          opts:
+            runtime_opts |> Keyword.delete(:operation_sleep_ms) |> Keyword.delete(:call_timeout)
+        })
+
+      %{state | pending_consolidation: pending}
+    else
+      state
     end
   end
 
@@ -235,7 +1194,7 @@ defmodule Jido.MemoryOS.MemoryManager do
            promote_long_records(target, runtime_opts, mid_context, long_context, state3) do
       summary = %{
         status: :ok,
-        phase: 2,
+        phase: 3,
         short_candidates_processed: length(short_records),
         mid_segments_written: Enum.count(segment_records, &(&1.kind == :segment)),
         mid_pages_written: Enum.count(page_records),
@@ -779,8 +1738,98 @@ defmodule Jido.MemoryOS.MemoryManager do
 
   @spec with_app_config(keyword(), state()) :: keyword()
   defp with_app_config(runtime_opts, state) do
-    Keyword.put_new(runtime_opts, :app_config, state.app_config)
+    Keyword.put_new(runtime_opts, :app_config, state.policy_cache)
   end
+
+  @spec request_agent_key(map() | struct(), keyword()) :: String.t()
+  defp request_agent_key(target, runtime_opts) do
+    explicit = Keyword.get(runtime_opts, :agent_id) || Keyword.get(runtime_opts, :agent_key)
+
+    cond do
+      is_binary(explicit) and String.trim(explicit) != "" -> String.trim(explicit)
+      is_binary(map_get(target, :id)) -> map_get(target, :id)
+      is_binary(map_get(runtime_opts, :namespace)) -> "ns:" <> map_get(runtime_opts, :namespace)
+      true -> "anonymous"
+    end
+  end
+
+  @spec normalize_timeout(term(), pos_integer()) :: pos_integer()
+  defp normalize_timeout(value, _fallback) when is_integer(value) and value > 0, do: value
+  defp normalize_timeout(_value, fallback), do: fallback
+
+  @spec normalize_trace_id(term()) :: String.t()
+  defp normalize_trace_id(value) when is_binary(value) and value != "", do: value
+
+  defp normalize_trace_id(_value) do
+    "mm-" <> Integer.to_string(System.unique_integer([:positive, :monotonic]))
+  end
+
+  @spec normalize_agent_key(term()) :: String.t() | :any
+  defp normalize_agent_key(nil), do: :any
+
+  defp normalize_agent_key(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: :any, else: trimmed
+  end
+
+  defp normalize_agent_key(_value), do: :any
+
+  @spec summarize_target(term()) :: map()
+  defp summarize_target(%{id: id}) when is_binary(id), do: %{id: id}
+
+  defp summarize_target(target) when is_map(target),
+    do: Map.take(target, [:id, :agent_id, "id", "agent_id"])
+
+  defp summarize_target(_), do: %{}
+
+  @spec push_dead_letter(state(), map()) :: state()
+  defp push_dead_letter(state, entry) do
+    limit = state.policy_cache.manager.dead_letter_limit
+    dead_letters = [entry | state.dead_letters] |> Enum.take(limit)
+
+    state
+    |> Map.put(:dead_letters, dead_letters)
+    |> increment_metric(:dead_lettered)
+  end
+
+  @spec maybe_reply(state(), GenServer.from() | nil, term()) :: state()
+  defp maybe_reply(state, nil, _result), do: state
+
+  defp maybe_reply(state, from, result) do
+    GenServer.reply(from, result)
+    state
+  end
+
+  @spec increment_metric(state(), atom(), non_neg_integer()) :: state()
+  defp increment_metric(state, metric, increment \\ 1) do
+    %{state | metrics: Map.update(state.metrics, metric, increment, &(&1 + increment))}
+  end
+
+  @spec to_query_map(term()) :: {:ok, map()} | {:error, term()}
+  defp to_query_map(%Jido.Memory.Query{} = query), do: {:ok, Map.from_struct(query)}
+  defp to_query_map(%{} = query), do: {:ok, query}
+
+  defp to_query_map(list) when is_list(list) do
+    if Keyword.keyword?(list), do: {:ok, Map.new(list)}, else: {:error, :invalid_query}
+  end
+
+  defp to_query_map(_), do: {:error, :invalid_query}
+
+  @spec normalize_integer(term(), integer()) :: integer()
+  defp normalize_integer(value, _fallback) when is_integer(value), do: value
+  defp normalize_integer(_value, fallback), do: fallback
+
+  @spec normalize_tags(term()) :: [String.t()]
+  defp normalize_tags(tags) when is_list(tags) do
+    tags
+    |> Enum.map(&to_string/1)
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.uniq()
+  end
+
+  defp normalize_tags(tags) when is_binary(tags), do: [String.trim(tags)]
+  defp normalize_tags(_), do: []
 
   @spec normalize_map(term()) :: map()
   defp normalize_map(%{} = map), do: map
@@ -792,6 +1841,6 @@ defmodule Jido.MemoryOS.MemoryManager do
   defp normalize_map(_), do: %{}
 
   @spec map_get(map(), atom(), term()) :: term()
-  defp map_get(map, key, default),
+  defp map_get(map, key, default \\ nil),
     do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
 end

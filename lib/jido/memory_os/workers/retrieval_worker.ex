@@ -1,9 +1,9 @@
-defmodule Jido.MemoryOS.Workers.ConsolidationWorker do
+defmodule Jido.MemoryOS.Workers.RetrievalWorker do
   @moduledoc """
-  Consolidation control-plane worker.
+  Retrieval control-plane worker.
 
-  Receives asynchronous consolidation schedules and delegates execution back
-  through the manager API.
+  Executes manager retrieval jobs in a dedicated process so callers can offload
+  non-blocking retrieval requests.
   """
 
   use GenServer
@@ -23,11 +23,16 @@ defmodule Jido.MemoryOS.Workers.ConsolidationWorker do
   end
 
   @doc """
-  Schedules one background consolidation request.
+  Schedules one asynchronous retrieval job.
   """
-  @spec schedule(GenServer.server(), map() | struct(), keyword()) :: :ok
-  def schedule(server \\ __MODULE__, target, opts \\ []) do
-    GenServer.cast(server, {:schedule, target, opts})
+  @spec retrieve(
+          GenServer.server(),
+          map() | struct(),
+          map() | keyword() | Jido.Memory.Query.t(),
+          keyword()
+        ) :: :ok
+  def retrieve(server \\ __MODULE__, target, query, opts \\ []) do
+    GenServer.cast(server, {:retrieve, target, query, opts})
   end
 
   @impl true
@@ -36,11 +41,11 @@ defmodule Jido.MemoryOS.Workers.ConsolidationWorker do
   end
 
   @impl true
-  def handle_cast({:schedule, target, opts}, state) do
+  def handle_cast({:retrieve, target, query, opts}, state) do
     manager = state.manager
 
     Task.start(fn ->
-      _ = MemoryManager.consolidate(target, Keyword.put(opts, :server, manager))
+      _ = MemoryManager.retrieve(target, query, Keyword.put(opts, :server, manager))
       :ok
     end)
 

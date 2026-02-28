@@ -11,7 +11,7 @@ defmodule Jido.MemoryOS.Config do
   alias Jido.MemoryOS.ConfigError
 
   @tiers [:short, :mid, :long]
-  @root_keys [:namespace_template, :tiers, :retrieval, :plugin, :safety, :lifecycle]
+  @root_keys [:namespace_template, :tiers, :retrieval, :plugin, :safety, :lifecycle, :manager]
   @tier_keys [:namespace_suffix, :store, :store_opts, :max_records, :ttl_ms, :promotion_threshold]
   @retrieval_keys [:limit, :ranking, :fallback]
   @ranking_keys [:lexical_weight, :semantic_weight]
@@ -23,6 +23,17 @@ defmodule Jido.MemoryOS.Config do
     :page_max_segments,
     :conflict_strategy,
     :promotion_min_score
+  ]
+  @manager_keys [
+    :queue_max_depth,
+    :queue_per_agent,
+    :request_timeout_ms,
+    :retry_attempts,
+    :retry_backoff_ms,
+    :retry_jitter_ms,
+    :dead_letter_limit,
+    :consolidation_debounce_ms,
+    :auto_consolidate
   ]
 
   @defaults %{
@@ -71,6 +82,17 @@ defmodule Jido.MemoryOS.Config do
       page_max_segments: 4,
       conflict_strategy: :version,
       promotion_min_score: 0.5
+    },
+    manager: %{
+      queue_max_depth: 256,
+      queue_per_agent: 32,
+      request_timeout_ms: 15_000,
+      retry_attempts: 2,
+      retry_backoff_ms: 30,
+      retry_jitter_ms: 20,
+      dead_letter_limit: 200,
+      consolidation_debounce_ms: 150,
+      auto_consolidate: true
     }
   }
 
@@ -85,7 +107,8 @@ defmodule Jido.MemoryOS.Config do
           retrieval: map(),
           plugin: map(),
           safety: map(),
-          lifecycle: map()
+          lifecycle: map(),
+          manager: map()
         }
 
   @doc """
@@ -135,6 +158,7 @@ defmodule Jido.MemoryOS.Config do
     {plugin, errors} = validate_plugin(Map.get(root_overrides, :plugin), errors)
     {safety, errors} = validate_safety(Map.get(root_overrides, :safety), errors)
     {lifecycle, errors} = validate_lifecycle(Map.get(root_overrides, :lifecycle), errors)
+    {manager, errors} = validate_manager(Map.get(root_overrides, :manager), errors)
 
     if errors == [] do
       {:ok,
@@ -144,7 +168,8 @@ defmodule Jido.MemoryOS.Config do
          retrieval: retrieval,
          plugin: plugin,
          safety: safety,
-         lifecycle: lifecycle
+         lifecycle: lifecycle,
+         manager: manager
        }}
     else
       {:error, Enum.reverse(errors)}
@@ -584,6 +609,131 @@ defmodule Jido.MemoryOS.Config do
      }, errors}
   end
 
+  @spec validate_manager(term(), [ConfigError.t()]) :: {map(), [ConfigError.t()]}
+  defp validate_manager(value, errors) do
+    path = [:manager]
+    {input, errors} = normalize_section_map(value, path, errors)
+    {normalized, unknown} = normalize_known_keys(input, @manager_keys)
+
+    errors =
+      Enum.reduce(unknown, errors, fn key, acc ->
+        [
+          error(path ++ [to_path_key(key)], :unknown_field, "unknown manager config key", key)
+          | acc
+        ]
+      end)
+
+    queue_max_depth = map_get(normalized, :queue_max_depth, @defaults.manager.queue_max_depth)
+
+    {queue_max_depth, errors} =
+      validate_positive_integer(
+        queue_max_depth,
+        path ++ [:queue_max_depth],
+        errors,
+        @defaults.manager.queue_max_depth
+      )
+
+    queue_per_agent = map_get(normalized, :queue_per_agent, @defaults.manager.queue_per_agent)
+
+    {queue_per_agent, errors} =
+      validate_positive_integer(
+        queue_per_agent,
+        path ++ [:queue_per_agent],
+        errors,
+        @defaults.manager.queue_per_agent
+      )
+
+    request_timeout_ms =
+      map_get(normalized, :request_timeout_ms, @defaults.manager.request_timeout_ms)
+
+    {request_timeout_ms, errors} =
+      validate_positive_integer(
+        request_timeout_ms,
+        path ++ [:request_timeout_ms],
+        errors,
+        @defaults.manager.request_timeout_ms
+      )
+
+    retry_attempts = map_get(normalized, :retry_attempts, @defaults.manager.retry_attempts)
+
+    {retry_attempts, errors} =
+      validate_non_negative_integer(
+        retry_attempts,
+        path ++ [:retry_attempts],
+        errors,
+        @defaults.manager.retry_attempts
+      )
+
+    retry_backoff_ms =
+      map_get(normalized, :retry_backoff_ms, @defaults.manager.retry_backoff_ms)
+
+    {retry_backoff_ms, errors} =
+      validate_non_negative_integer(
+        retry_backoff_ms,
+        path ++ [:retry_backoff_ms],
+        errors,
+        @defaults.manager.retry_backoff_ms
+      )
+
+    retry_jitter_ms = map_get(normalized, :retry_jitter_ms, @defaults.manager.retry_jitter_ms)
+
+    {retry_jitter_ms, errors} =
+      validate_non_negative_integer(
+        retry_jitter_ms,
+        path ++ [:retry_jitter_ms],
+        errors,
+        @defaults.manager.retry_jitter_ms
+      )
+
+    dead_letter_limit =
+      map_get(normalized, :dead_letter_limit, @defaults.manager.dead_letter_limit)
+
+    {dead_letter_limit, errors} =
+      validate_positive_integer(
+        dead_letter_limit,
+        path ++ [:dead_letter_limit],
+        errors,
+        @defaults.manager.dead_letter_limit
+      )
+
+    consolidation_debounce_ms =
+      map_get(
+        normalized,
+        :consolidation_debounce_ms,
+        @defaults.manager.consolidation_debounce_ms
+      )
+
+    {consolidation_debounce_ms, errors} =
+      validate_non_negative_integer(
+        consolidation_debounce_ms,
+        path ++ [:consolidation_debounce_ms],
+        errors,
+        @defaults.manager.consolidation_debounce_ms
+      )
+
+    auto_consolidate = map_get(normalized, :auto_consolidate, @defaults.manager.auto_consolidate)
+
+    {auto_consolidate, errors} =
+      validate_boolean(
+        auto_consolidate,
+        path ++ [:auto_consolidate],
+        errors,
+        @defaults.manager.auto_consolidate
+      )
+
+    {%{
+       queue_max_depth: queue_max_depth,
+       queue_per_agent: queue_per_agent,
+       request_timeout_ms: request_timeout_ms,
+       retry_attempts: retry_attempts,
+       retry_backoff_ms: retry_backoff_ms,
+       retry_jitter_ms: retry_jitter_ms,
+       dead_letter_limit: dead_letter_limit,
+       consolidation_debounce_ms: consolidation_debounce_ms,
+       auto_consolidate: auto_consolidate
+     }, errors}
+  end
+
   @spec validate_store(term(), term(), [atom()], [ConfigError.t()], {module(), keyword()}) ::
           {{module(), keyword()}, [ConfigError.t()]}
   defp validate_store(store_value, store_opts, path, errors, fallback_store) do
@@ -694,6 +844,17 @@ defmodule Jido.MemoryOS.Config do
 
   defp validate_positive_integer(value, path, errors, fallback) do
     {fallback, [error(path, :invalid_type, "must be a positive integer", value) | errors]}
+  end
+
+  @spec validate_non_negative_integer(term(), [atom()], [ConfigError.t()], non_neg_integer()) ::
+          {non_neg_integer(), [ConfigError.t()]}
+  defp validate_non_negative_integer(value, _path, errors, _fallback)
+       when is_integer(value) and value >= 0 do
+    {value, errors}
+  end
+
+  defp validate_non_negative_integer(value, path, errors, fallback) do
+    {fallback, [error(path, :invalid_type, "must be a non-negative integer", value) | errors]}
   end
 
   @spec validate_non_negative_number(term(), [atom()], [ConfigError.t()], number()) ::
