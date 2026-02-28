@@ -7,11 +7,29 @@ defmodule Jido.MemoryOS.MemoryManager do
   use GenServer
 
   alias Jido.MemoryOS.Adapter.MemoryRuntime
-  alias Jido.MemoryOS.{Config, ErrorMapping, Lifecycle, Metadata, Query}
+
+  alias Jido.MemoryOS.{
+    AccessPolicy,
+    ApprovalToken,
+    Config,
+    DataSafety,
+    ErrorMapping,
+    Lifecycle,
+    Metadata,
+    Query
+  }
+
   alias Jido.MemoryOS.Retrieval.{Candidate, ContextPack, Planner, Ranker}
 
   @type candidate :: {String.t(), String.t()}
-  @type operation :: :remember | :retrieve | :explain_retrieval | :forget | :prune | :consolidate
+  @type operation ::
+          :remember
+          | :retrieve
+          | :explain_retrieval
+          | :forget
+          | :prune
+          | :consolidate
+          | :policy_update
 
   @type request :: %{
           id: String.t(),
@@ -52,6 +70,9 @@ defmodule Jido.MemoryOS.MemoryManager do
           processing: boolean(),
           dead_letters: [map()],
           metrics: map(),
+          approval_tokens: %{optional(String.t()) => map()},
+          audit_log: [map()],
+          audit_seq: non_neg_integer(),
           pending_consolidation: %{
             optional(String.t()) => %{
               ref: reference(),
@@ -133,6 +154,33 @@ defmodule Jido.MemoryOS.MemoryManager do
   end
 
   @doc """
+  Updates access policy at runtime (approval-gated when configured).
+  """
+  @spec update_policy(map() | struct(), map() | keyword(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def update_policy(target, policy, opts \\ []) do
+    {server, runtime_opts} = Keyword.pop(opts, :server, __MODULE__)
+    call_timeout = Keyword.get(runtime_opts, :call_timeout, :infinity)
+    GenServer.call(server, {:update_policy, target, policy, runtime_opts}, call_timeout)
+  end
+
+  @doc """
+  Issues approval token for gated operations.
+  """
+  @spec issue_approval_token(GenServer.server(), keyword()) :: {:ok, map()} | {:error, term()}
+  def issue_approval_token(server \\ __MODULE__, opts \\ []) do
+    GenServer.call(server, {:issue_approval_token, opts})
+  end
+
+  @doc """
+  Returns immutable audit events (newest first).
+  """
+  @spec audit_events(GenServer.server(), keyword()) :: {:ok, [map()]}
+  def audit_events(server \\ __MODULE__, opts \\ []) do
+    GenServer.call(server, {:audit_events, opts})
+  end
+
+  @doc """
   Returns currently loaded app config after validation/defaulting.
   """
   @spec current_config(GenServer.server()) :: {:ok, Config.t()} | {:error, term()}
@@ -202,6 +250,9 @@ defmodule Jido.MemoryOS.MemoryManager do
              dead_lettered: 0,
              cancelled: 0
            },
+           approval_tokens: %{},
+           audit_log: [],
+           audit_seq: 0,
            pending_consolidation: %{}
          }}
 
@@ -241,6 +292,11 @@ defmodule Jido.MemoryOS.MemoryManager do
   end
 
   @impl true
+  def handle_call({:update_policy, target, policy, runtime_opts}, from, state) do
+    enqueue_reply_request(:policy_update, target, policy, runtime_opts, from, state)
+  end
+
+  @impl true
   def handle_call(:current_config, _from, state) do
     {:reply, {:ok, state.policy_cache}, state}
   end
@@ -259,10 +315,59 @@ defmodule Jido.MemoryOS.MemoryManager do
   def handle_call(:metrics, _from, state) do
     queue_metrics = %{
       queue_depth: state.queue_depth,
-      pending_agents: map_size(state.queue_by_agent)
+      pending_agents: map_size(state.queue_by_agent),
+      approvals_active: map_size(state.approval_tokens),
+      audit_events: length(state.audit_log)
     }
 
     {:reply, {:ok, Map.merge(state.metrics, queue_metrics)}, state}
+  end
+
+  @impl true
+  def handle_call({:audit_events, opts}, _from, state) do
+    limit = max(1, normalize_integer(Keyword.get(opts, :limit), 200))
+    {:reply, {:ok, Enum.take(state.audit_log, limit)}, state}
+  end
+
+  @impl true
+  def handle_call({:issue_approval_token, opts}, _from, state) do
+    approvals_cfg = approval_config(state)
+    actor_id = normalize_optional_string(Keyword.get(opts, :actor_id))
+    actions = normalize_atom_list(Keyword.get(opts, :actions))
+    issue_opts = [actor_id: actor_id, reason: Keyword.get(opts, :reason)]
+
+    issue_opts =
+      issue_opts
+      |> maybe_put_kw(:actions, if(actions == [], do: nil, else: actions))
+      |> maybe_put_kw(:ttl_ms, Keyword.get(opts, :ttl_ms))
+      |> maybe_put_kw(:one_time, Keyword.get(opts, :one_time))
+
+    defaults = [
+      ttl_ms: map_get(approvals_cfg, :ttl_ms, 300_000),
+      max_tokens: map_get(approvals_cfg, :max_tokens, 500),
+      one_time: map_get(approvals_cfg, :one_time, true),
+      actions: map_get(approvals_cfg, :required_actions, [])
+    ]
+
+    {:ok, entry, tokens} = ApprovalToken.issue(state.approval_tokens, issue_opts, defaults)
+
+    state1 =
+      state
+      |> Map.put(:approval_tokens, tokens)
+      |> append_audit_event(%{
+        category: :approval,
+        outcome: :issued,
+        actor_id: actor_id,
+        action: :issue_approval_token,
+        metadata: %{
+          token: entry.token,
+          actions: entry.actions,
+          expires_at: entry.expires_at,
+          reason: entry.reason
+        }
+      })
+
+    {:reply, {:ok, entry}, state1}
   end
 
   @impl true
@@ -275,7 +380,16 @@ defmodule Jido.MemoryOS.MemoryManager do
         nil ->
           :any
 
-        op when op in [:remember, :retrieve, :explain_retrieval, :forget, :prune, :consolidate] ->
+        op
+        when op in [
+               :remember,
+               :retrieve,
+               :explain_retrieval,
+               :forget,
+               :prune,
+               :consolidate,
+               :policy_update
+             ] ->
           op
 
         _ ->
@@ -617,15 +731,35 @@ defmodule Jido.MemoryOS.MemoryManager do
       if System.system_time(:millisecond) > request.deadline_ms do
         timeout_result(request, state)
       else
-        case request.op do
-          :remember -> remember_request(request, state)
-          :retrieve -> retrieve_request(request, state, false)
-          :explain_retrieval -> retrieve_request(request, state, true)
-          :forget -> forget_request(request, state)
-          :prune -> prune_request(request, state)
-          :consolidate -> consolidate_request(request, state)
+        policy_context = policy_context(request)
+        before_pointer = mutation_before_pointer(request, state)
+
+        with {:ok, state1} <- enforce_policy(request, policy_context, state),
+             {:ok, state2} <- enforce_approval_if_required(request, policy_context, state1),
+             {result, state3} <- dispatch_request(request, state2) do
+          state4 = audit_operation_result(request, policy_context, result, before_pointer, state3)
+          {result, state4}
+        else
+          {:error, reason, state1} ->
+            result = {:error, to_jido_error(reason, request.op)}
+
+            {result,
+             audit_operation_result(request, policy_context, result, before_pointer, state1)}
         end
       end
+    end
+  end
+
+  @spec dispatch_request(request(), state()) :: {term(), state()}
+  defp dispatch_request(request, state) do
+    case request.op do
+      :remember -> remember_request(request, state)
+      :retrieve -> retrieve_request(request, state, false)
+      :explain_retrieval -> retrieve_request(request, state, true)
+      :forget -> forget_request(request, state)
+      :prune -> prune_request(request, state)
+      :consolidate -> consolidate_request(request, state)
+      :policy_update -> update_policy_request(request, state)
     end
   end
 
@@ -643,40 +777,289 @@ defmodule Jido.MemoryOS.MemoryManager do
     {result, increment_metric(state, :timed_out)}
   end
 
+  @spec policy_context(request()) :: AccessPolicy.context()
+  defp policy_context(request) do
+    AccessPolicy.context_from_request(
+      request.op,
+      request.target,
+      request.runtime_opts,
+      request.trace_id
+    )
+  end
+
+  @spec enforce_policy(request(), AccessPolicy.context(), state()) ::
+          {:ok, state()} | {:error, term(), state()}
+  defp enforce_policy(request, policy_context, state) do
+    decision =
+      AccessPolicy.evaluate(policy_context, map_get(state.policy_cache, :governance, %{}).policy)
+
+    state1 =
+      append_audit_event(state, %{
+        category: :access,
+        action: request.op,
+        outcome: if(decision.allowed?, do: :allow, else: :deny),
+        actor_id: policy_context.actor_id,
+        actor_group: policy_context.actor_group,
+        actor_role: policy_context.actor_role,
+        target_agent_id: policy_context.target_agent_id,
+        target_group: policy_context.target_group,
+        tier: policy_context.tier,
+        trace_id: policy_context.trace_id,
+        metadata: %{
+          reason: decision.reason,
+          effect: decision.effect,
+          matched_rule: decision.matched_rule
+        }
+      })
+
+    if decision.allowed? do
+      {:ok, state1}
+    else
+      {:error, {:access_denied, decision}, state1}
+    end
+  end
+
+  @spec enforce_approval_if_required(request(), AccessPolicy.context(), state()) ::
+          {:ok, state()} | {:error, term(), state()}
+  defp enforce_approval_if_required(request, policy_context, state) do
+    case approval_action(request) do
+      nil ->
+        {:ok, state}
+
+      required_action ->
+        token = Keyword.get(request.runtime_opts, :approval_token)
+
+        case ApprovalToken.validate(
+               state.approval_tokens,
+               token,
+               required_action,
+               policy_context.actor_id
+             ) do
+          {:ok, entry, tokens} ->
+            state1 =
+              state
+              |> Map.put(:approval_tokens, tokens)
+              |> append_audit_event(%{
+                category: :approval,
+                action: request.op,
+                outcome: :approved,
+                actor_id: policy_context.actor_id,
+                target_agent_id: policy_context.target_agent_id,
+                tier: policy_context.tier,
+                trace_id: policy_context.trace_id,
+                metadata: %{
+                  required_action: required_action,
+                  token: entry.token,
+                  expires_at: entry.expires_at
+                }
+              })
+
+            {:ok, state1}
+
+          {:error, reason, tokens} ->
+            state1 =
+              state
+              |> Map.put(:approval_tokens, tokens)
+              |> append_audit_event(%{
+                category: :approval,
+                action: request.op,
+                outcome: :denied,
+                actor_id: policy_context.actor_id,
+                target_agent_id: policy_context.target_agent_id,
+                tier: policy_context.tier,
+                trace_id: policy_context.trace_id,
+                metadata: %{required_action: required_action, reason: reason}
+              })
+
+            {:error, reason, state1}
+        end
+    end
+  end
+
+  @spec approval_action(request()) :: atom() | nil
+  defp approval_action(request) do
+    required_actions = approval_required_actions(request.runtime_opts)
+
+    cond do
+      :policy_update in required_actions and request.op == :policy_update ->
+        :policy_update
+
+      :forget in required_actions and request.op == :forget ->
+        :forget
+
+      :overwrite in required_actions and request.op == :remember and
+          has_explicit_id?(request.payload) ->
+        :overwrite
+
+      true ->
+        nil
+    end
+  end
+
+  @spec has_explicit_id?(term()) :: boolean()
+  defp has_explicit_id?(payload) do
+    payload
+    |> normalize_map()
+    |> map_get(:id)
+    |> case do
+      value when is_binary(value) and value != "" -> true
+      _ -> false
+    end
+  end
+
+  @spec approval_required_actions(keyword()) :: [atom()]
+  defp approval_required_actions(runtime_opts) do
+    approvals =
+      runtime_opts
+      |> Keyword.get(:app_config, %{})
+      |> map_get(:governance, %{})
+      |> map_get(:approvals, %{})
+
+    if map_get(approvals, :enabled, true) do
+      approvals
+      |> map_get(:required_actions, [])
+      |> normalize_atom_list()
+    else
+      []
+    end
+  end
+
+  @spec mutation_before_pointer(request(), state()) :: map() | nil
+  defp mutation_before_pointer(request, state) do
+    case request.op do
+      :remember ->
+        payload = normalize_map(request.payload)
+
+        case map_get(payload, :id) do
+          id when is_binary(id) and id != "" -> %{memory_id: id}
+          _ -> nil
+        end
+
+      :forget ->
+        %{memory_id: request.payload}
+
+      :policy_update ->
+        policy = map_get(state.policy_cache, :governance, %{}) |> map_get(:policy, %{})
+        %{policy_hash: policy_hash(policy)}
+
+      _ ->
+        nil
+    end
+  end
+
+  @spec mutation_after_pointer(request(), term()) :: map() | nil
+  defp mutation_after_pointer(request, result) do
+    case {request.op, result} do
+      {:remember, {:ok, %Jido.Memory.Record{} = record}} ->
+        %{memory_id: record.id, namespace: record.namespace}
+
+      {:forget, {:ok, deleted?}} ->
+        %{memory_id: request.payload, deleted?: deleted?}
+
+      {:policy_update, {:ok, policy}} ->
+        %{policy_hash: policy_hash(policy)}
+
+      {:explain_retrieval, {:ok, explain}} when is_map(explain) ->
+        %{
+          result_count: map_get(explain, :result_count, 0),
+          explanation_hash: DataSafety.explanation_hash(explain)
+        }
+
+      _ ->
+        nil
+    end
+  end
+
+  @spec audit_operation_result(request(), AccessPolicy.context(), term(), map() | nil, state()) ::
+          state()
+  defp audit_operation_result(request, policy_context, result, before_pointer, state) do
+    after_pointer = mutation_after_pointer(request, result)
+
+    {outcome, error_code} =
+      case result do
+        {:ok, _} -> {:ok, nil}
+        {:error, %{} = err} -> {:error, error_code(err)}
+        {:error, reason} -> {:error, reason}
+        _ -> {:ok, nil}
+      end
+
+    metadata =
+      %{
+        correlation_id: policy_context.correlation_id,
+        before_pointer: before_pointer,
+        after_pointer: after_pointer
+      }
+      |> maybe_put_map(:error_code, error_code)
+      |> maybe_put_map(:result_shape, result_shape(result))
+
+    append_audit_event(state, %{
+      category: :operation,
+      action: request.op,
+      outcome: outcome,
+      actor_id: policy_context.actor_id,
+      actor_group: policy_context.actor_group,
+      actor_role: policy_context.actor_role,
+      target_agent_id: policy_context.target_agent_id,
+      target_group: policy_context.target_group,
+      tier: policy_context.tier,
+      trace_id: policy_context.trace_id,
+      metadata: metadata
+    })
+  end
+
+  @spec result_shape(term()) :: atom()
+  defp result_shape({:ok, _}), do: :ok
+  defp result_shape({:error, _}), do: :error
+  defp result_shape(_), do: :unknown
+
   @spec remember_request(request(), state()) :: {term(), state()}
   defp remember_request(request, state) do
     runtime_opts = request.runtime_opts
 
-    case normalize_tier(Keyword.get(runtime_opts, :tier, :short)) do
-      {:ok, :short} ->
-        {result, state1} =
-          remember_short(request.target, request.payload, runtime_opts, state, request.trace_id)
+    with {:ok, tier} <- normalize_tier(Keyword.get(runtime_opts, :tier, :short)),
+         {:ok, attrs} <-
+           DataSafety.sanitize_attrs(
+             normalize_map(request.payload),
+             tier,
+             state.policy_cache,
+             System.system_time(:millisecond)
+           ) do
+      case tier do
+        :short ->
+          {result, state1} =
+            remember_short(request.target, attrs, runtime_opts, state, request.trace_id)
 
-        {result, state1}
+          {result, state1}
 
-      {:ok, _tier} ->
-        result =
-          retry_runtime_remember(
-            request.target,
-            request.payload,
-            runtime_opts,
-            state,
-            :remember,
-            request.trace_id
-          )
+        _other ->
+          result =
+            retry_runtime_remember(
+              request.target,
+              attrs,
+              runtime_opts,
+              state,
+              :remember,
+              request.trace_id
+            )
 
-        case result do
-          {{:ok, record}, state1} -> {{:ok, record}, state1}
-          {{:error, reason}, state1} -> {{:error, to_jido_error(reason, :remember)}, state1}
-        end
-
+          case result do
+            {{:ok, record}, state1} -> {{:ok, record}, state1}
+            {{:error, reason}, state1} -> {{:error, to_jido_error(reason, :remember)}, state1}
+          end
+      end
+    else
       {:error, reason} ->
-        {{:error, ErrorMapping.from_reason(reason, :remember)}, state}
+        {{:error, to_jido_error(reason, :remember)}, state}
     end
   end
 
   @spec retrieve_request(request(), state(), boolean()) :: {term(), state()}
   defp retrieve_request(request, state, explain?) do
+    policy_ctx = policy_context(request)
+
+    masking_mode =
+      AccessPolicy.masking_mode(policy_ctx, map_get(state.policy_cache, :governance, %{}))
+
     with {:ok, query} <-
            Query.new(request.payload,
              default_limit: state.policy_cache.retrieval.limit,
@@ -686,29 +1069,31 @@ defmodule Jido.MemoryOS.MemoryManager do
          query <- maybe_enable_explain_mode(query, explain?),
          {:ok, retrieval} <-
            run_retrieval_pipeline(request.target, query, request.runtime_opts, state) do
+      masked_records = DataSafety.mask_records(retrieval.records, masking_mode)
+
       if explain? do
-        {:ok,
-         %{
-           query: Map.from_struct(query),
-           result_count: length(retrieval.records),
-           retrieval: state.policy_cache.retrieval,
-           lifecycle: state.policy_cache.lifecycle,
-           manager: state.policy_cache.manager,
-           tier_mode: retrieval.tier_mode,
-           planner: retrieval.plan,
-           queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
-           records: Enum.map(retrieval.records, &record_debug/1),
-           scored_candidates: retrieval.scored_candidates,
-           excluded: retrieval.excluded,
-           context_pack: retrieval.context_pack,
-           semantic_provider: retrieval.semantic,
-           decision_trace: retrieval.decision_trace,
-           selection_rationale: retrieval.selection_rationale,
-           recent_conflicts: state.last_conflicts
-         }}
-        |> then(&{&1, state})
+        explain_payload = %{
+          query: Map.from_struct(query),
+          result_count: length(masked_records),
+          retrieval: state.policy_cache.retrieval,
+          lifecycle: state.policy_cache.lifecycle,
+          manager: state.policy_cache.manager,
+          tier_mode: retrieval.tier_mode,
+          planner: retrieval.plan,
+          queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
+          records: Enum.map(masked_records, &record_debug/1),
+          scored_candidates: retrieval.scored_candidates,
+          excluded: retrieval.excluded,
+          context_pack: retrieval.context_pack,
+          semantic_provider: retrieval.semantic,
+          decision_trace: retrieval.decision_trace,
+          selection_rationale: retrieval.selection_rationale,
+          recent_conflicts: state.last_conflicts
+        }
+
+        {{:ok, DataSafety.mask_explain_payload(explain_payload, masking_mode)}, state}
       else
-        {{:ok, retrieval.records}, state}
+        {{:ok, masked_records}, state}
       end
     else
       {:error, reason} ->
@@ -740,6 +1125,16 @@ defmodule Jido.MemoryOS.MemoryManager do
   defp consolidate_request(request, state) do
     {result, state1} = run_consolidation(request.target, request.runtime_opts, state)
     {result, state1}
+  end
+
+  @spec update_policy_request(request(), state()) :: {term(), state()}
+  defp update_policy_request(request, state) do
+    governance = map_get(state.policy_cache, :governance, %{})
+    next_policy = AccessPolicy.normalize_policy(request.payload)
+    next_governance = Map.put(governance, :policy, next_policy)
+    next_policy_cache = Map.put(state.policy_cache, :governance, next_governance)
+
+    {{:ok, next_policy}, %{state | policy_cache: next_policy_cache}}
   end
 
   @spec run_retrieval_pipeline(map() | struct(), Query.t(), keyword(), state()) ::
@@ -1696,11 +2091,12 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec request_agent_key(map() | struct(), keyword()) :: String.t()
   defp request_agent_key(target, runtime_opts) do
     explicit = Keyword.get(runtime_opts, :agent_id) || Keyword.get(runtime_opts, :agent_key)
+    namespace = Keyword.get(runtime_opts, :namespace)
 
     cond do
       is_binary(explicit) and String.trim(explicit) != "" -> String.trim(explicit)
       is_binary(map_get(target, :id)) -> map_get(target, :id)
-      is_binary(map_get(runtime_opts, :namespace)) -> "ns:" <> map_get(runtime_opts, :namespace)
+      is_binary(namespace) and String.trim(namespace) != "" -> "ns:" <> namespace
       true -> "anonymous"
     end
   end
@@ -1771,6 +2167,114 @@ defmodule Jido.MemoryOS.MemoryManager do
   defp normalize_map(_), do: %{}
 
   @spec map_get(map(), atom(), term()) :: term()
-  defp map_get(map, key, default \\ nil),
-    do: Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  defp map_get(map, key, default \\ nil)
+
+  defp map_get(map, key, default) when is_map(map) do
+    Map.get(map, key, Map.get(map, Atom.to_string(key), default))
+  end
+
+  defp map_get(list, key, default) when is_list(list) do
+    if Keyword.keyword?(list),
+      do: Keyword.get(list, key, Keyword.get(list, Atom.to_string(key), default)),
+      else: default
+  end
+
+  defp map_get(_, _key, default), do: default
+
+  @spec approval_config(state()) :: map()
+  defp approval_config(state) do
+    state
+    |> map_get(:policy_cache, %{})
+    |> map_get(:governance, %{})
+    |> map_get(:approvals, %{})
+  end
+
+  @spec audit_config(state()) :: map()
+  defp audit_config(state) do
+    state
+    |> map_get(:policy_cache, %{})
+    |> map_get(:governance, %{})
+    |> map_get(:audit, %{})
+  end
+
+  @spec append_audit_event(state(), map()) :: state()
+  defp append_audit_event(state, event) do
+    cfg = audit_config(state)
+
+    if map_get(cfg, :enabled, true) do
+      seq = state.audit_seq + 1
+      max_events = max(1, normalize_integer(map_get(cfg, :max_events), 2_000))
+
+      entry =
+        event
+        |> normalize_map()
+        |> Map.put_new(:at, System.system_time(:millisecond))
+        |> Map.put_new(:seq, seq)
+
+      %{state | audit_seq: seq, audit_log: [entry | state.audit_log] |> Enum.take(max_events)}
+    else
+      state
+    end
+  end
+
+  @spec normalize_optional_string(term()) :: String.t() | nil
+  defp normalize_optional_string(nil), do: nil
+
+  defp normalize_optional_string(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    if trimmed == "", do: nil, else: trimmed
+  end
+
+  defp normalize_optional_string(value), do: value |> to_string() |> normalize_optional_string()
+
+  @spec normalize_atom_list(term()) :: [atom()]
+  defp normalize_atom_list(list) when is_list(list) do
+    list
+    |> Enum.map(&normalize_atom/1)
+    |> Enum.reject(&is_nil/1)
+    |> Enum.uniq()
+  end
+
+  defp normalize_atom_list(value), do: normalize_atom_list([value])
+
+  @spec normalize_atom(term()) :: atom() | nil
+  defp normalize_atom(value) when is_atom(value) do
+    if value in [:forget, :overwrite, :policy_update], do: value, else: nil
+  end
+
+  defp normalize_atom(value) when is_binary(value) do
+    trimmed = String.trim(value)
+    allowed = %{"forget" => :forget, "overwrite" => :overwrite, "policy_update" => :policy_update}
+
+    if trimmed == "" do
+      nil
+    else
+      Map.get(allowed, trimmed)
+    end
+  end
+
+  defp normalize_atom(_value), do: nil
+
+  @spec maybe_put_kw(keyword(), atom(), term()) :: keyword()
+  defp maybe_put_kw(keyword, _key, nil), do: keyword
+  defp maybe_put_kw(keyword, key, value), do: Keyword.put(keyword, key, value)
+
+  @spec maybe_put_map(map(), atom(), term()) :: map()
+  defp maybe_put_map(map, _key, nil), do: map
+  defp maybe_put_map(map, key, value), do: Map.put(map, key, value)
+
+  @spec policy_hash(term()) :: String.t()
+  defp policy_hash(policy) do
+    policy
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  @spec error_code(map()) :: term()
+  defp error_code(err) do
+    err
+    |> Map.get(:details, %{})
+    |> map_get(:code)
+  end
 end
