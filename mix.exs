@@ -9,6 +9,10 @@ defmodule JidoMemoryOs.MixProject do
       version: "0.1.0",
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
+      dialyzer: [
+        flags: [:error_handling, :underspecs, :unknown, :unmatched_returns],
+        plt_add_apps: [:mix]
+      ],
       deps: deps()
     ]
   end
@@ -26,7 +30,9 @@ defmodule JidoMemoryOs.MixProject do
     [
       {:jido, "~> 2.0.0-rc.5"},
       {:jido_action, github: "agentjido/jido_action", branch: "main", override: true},
-      {:jido_memory, github: "agentjido/jido_memory", ref: @jido_memory_ref}
+      {:jido_memory, github: "agentjido/jido_memory", ref: @jido_memory_ref},
+      {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
+      {:dialyxir, "~> 1.4", only: [:dev], runtime: false}
     ]
   end
 end
