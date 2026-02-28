@@ -109,10 +109,15 @@ defmodule Jido.MemoryOS.Query do
   """
   @spec to_runtime_filters(t(), pos_integer()) :: map()
   def to_runtime_filters(%__MODULE__{} = query, limit_override) do
+    selective_tags =
+      query.persona_keys
+      |> Enum.map(&("persona:" <> &1))
+      |> Kernel.++(Enum.map(query.topic_keys, &("topic:" <> &1)))
+
     %{
       classes: query.classes,
       kinds: query.kinds,
-      tags_any: query.tags_any,
+      tags_any: Enum.uniq(query.tags_any ++ selective_tags),
       tags_all: query.tags_all,
       text_contains: query.text_contains,
       since: query.since,

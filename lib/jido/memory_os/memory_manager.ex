@@ -14,6 +14,7 @@ defmodule Jido.MemoryOS.MemoryManager do
     Config,
     DataSafety,
     ErrorMapping,
+    Journal,
     Lifecycle,
     Metadata,
     Query
@@ -42,7 +43,9 @@ defmodule Jido.MemoryOS.MemoryManager do
           enqueued_at: integer(),
           deadline_ms: integer(),
           trace_id: String.t(),
-          internal?: boolean()
+          internal?: boolean(),
+          idempotency_key: String.t() | nil,
+          replay_safe?: boolean()
         }
 
   @type retrieval_feature :: %{
@@ -73,6 +76,13 @@ defmodule Jido.MemoryOS.MemoryManager do
           approval_tokens: %{optional(String.t()) => map()},
           audit_log: [map()],
           audit_seq: non_neg_integer(),
+          query_cache: %{optional(String.t()) => map()},
+          query_cache_by_agent: %{optional(String.t()) => MapSet.t(String.t())},
+          journal_path: String.t() | nil,
+          journal_limit: pos_integer(),
+          journal_events: [map()],
+          journal_index: %{optional(String.t()) => map()},
+          idempotent_results: %{optional(String.t()) => term()},
           pending_consolidation: %{
             optional(String.t()) => %{
               ref: reference(),
@@ -181,6 +191,14 @@ defmodule Jido.MemoryOS.MemoryManager do
   end
 
   @doc """
+  Returns operation journal events (newest first).
+  """
+  @spec journal_events(GenServer.server(), keyword()) :: {:ok, [map()]}
+  def journal_events(server \\ __MODULE__, opts \\ []) do
+    GenServer.call(server, {:journal_events, opts})
+  end
+
+  @doc """
   Returns currently loaded app config after validation/defaulting.
   """
   @spec current_config(GenServer.server()) :: {:ok, Config.t()} | {:error, term()}
@@ -226,35 +244,62 @@ defmodule Jido.MemoryOS.MemoryManager do
 
     case Config.validate(app_config) do
       {:ok, config} ->
-        {:ok,
-         %{
-           app_config: app_config,
-           policy_cache: config,
-           short_candidates: MapSet.new(),
-           long_candidates: MapSet.new(),
-           turn_counters: %{},
-           consolidation_version: 1,
-           last_conflicts: [],
-           queue_by_agent: %{},
-           agent_order: :queue.new(),
-           scheduled_agents: MapSet.new(),
-           queue_depth: 0,
-           processing: false,
-           dead_letters: [],
-           metrics: %{
-             queued: 0,
-             processed: 0,
-             timed_out: 0,
-             overloaded: 0,
-             retried: 0,
-             dead_lettered: 0,
-             cancelled: 0
-           },
-           approval_tokens: %{},
-           audit_log: [],
-           audit_seq: 0,
-           pending_consolidation: %{}
-         }}
+        name = Keyword.get(opts, :name, __MODULE__)
+        journal_path = resolve_journal_path(config, name)
+
+        {journal_events, journal_index, idempotent_results, replay_backlog} =
+          bootstrap_journal(journal_path)
+
+        state = %{
+          app_config: app_config,
+          policy_cache: config,
+          short_candidates: MapSet.new(),
+          long_candidates: MapSet.new(),
+          turn_counters: %{},
+          consolidation_version: 1,
+          last_conflicts: [],
+          queue_by_agent: %{},
+          agent_order: :queue.new(),
+          scheduled_agents: MapSet.new(),
+          queue_depth: 0,
+          processing: false,
+          dead_letters: [],
+          metrics: %{
+            queued: 0,
+            processed: 0,
+            timed_out: 0,
+            overloaded: 0,
+            throttled: 0,
+            retried: 0,
+            dead_lettered: 0,
+            cancelled: 0,
+            cache_hit: 0,
+            cache_miss: 0,
+            cache_invalidated: 0,
+            idempotent_reused: 0,
+            journal_replayed: 0,
+            starvation_prevented: 0
+          },
+          approval_tokens: %{},
+          audit_log: [],
+          audit_seq: 0,
+          query_cache: %{},
+          query_cache_by_agent: %{},
+          journal_path: journal_path,
+          journal_limit:
+            max(1, normalize_integer(map_get(config.manager, :journal_limit), 2_000)),
+          journal_events: journal_events,
+          journal_index: journal_index,
+          idempotent_results: idempotent_results,
+          pending_consolidation: %{}
+        }
+
+        if replay_backlog == [] or not map_get(config.manager, :replay_on_start, true) do
+          {:ok, state}
+        else
+          send(self(), {:replay_journal, replay_backlog})
+          {:ok, state}
+        end
 
       {:error, reason} ->
         {:stop, ErrorMapping.from_reason(reason, :init)}
@@ -317,7 +362,9 @@ defmodule Jido.MemoryOS.MemoryManager do
       queue_depth: state.queue_depth,
       pending_agents: map_size(state.queue_by_agent),
       approvals_active: map_size(state.approval_tokens),
-      audit_events: length(state.audit_log)
+      audit_events: length(state.audit_log),
+      query_cache_entries: map_size(state.query_cache),
+      journal_events: length(state.journal_events)
     }
 
     {:reply, {:ok, Map.merge(state.metrics, queue_metrics)}, state}
@@ -327,6 +374,12 @@ defmodule Jido.MemoryOS.MemoryManager do
   def handle_call({:audit_events, opts}, _from, state) do
     limit = max(1, normalize_integer(Keyword.get(opts, :limit), 200))
     {:reply, {:ok, Enum.take(state.audit_log, limit)}, state}
+  end
+
+  @impl true
+  def handle_call({:journal_events, opts}, _from, state) do
+    limit = max(1, normalize_integer(Keyword.get(opts, :limit), 200))
+    {:reply, {:ok, Enum.take(state.journal_events, limit)}, state}
   end
 
   @impl true
@@ -445,6 +498,17 @@ defmodule Jido.MemoryOS.MemoryManager do
   end
 
   @impl true
+  def handle_info({:replay_journal, replay_backlog}, state) do
+    {state1, replayed} = enqueue_replay_backlog(state, replay_backlog)
+
+    if state1.queue_depth > 0 do
+      send(self(), :drain_queue)
+    end
+
+    {:noreply, increment_metric(state1, :journal_replayed, replayed)}
+  end
+
+  @impl true
   def handle_info({:auto_consolidate, namespace, ref}, state) do
     case Map.get(state.pending_consolidation, namespace) do
       %{ref: ^ref, target: target, opts: opts} ->
@@ -456,6 +520,9 @@ defmodule Jido.MemoryOS.MemoryManager do
         case enqueue_request(:consolidate, target, :none, opts, nil, state1, internal?: true) do
           {:ok, state2} ->
             send(self(), :drain_queue)
+            {:noreply, state2}
+
+          {:duplicate, _result, state2} ->
             {:noreply, state2}
 
           {:error, _reason, state2} ->
@@ -484,6 +551,9 @@ defmodule Jido.MemoryOS.MemoryManager do
         send(self(), :drain_queue)
         {:noreply, state1}
 
+      {:duplicate, result, state1} ->
+        {:reply, result, state1}
+
       {:error, reason, state1} ->
         {:reply, {:error, reason}, state1}
     end
@@ -498,7 +568,7 @@ defmodule Jido.MemoryOS.MemoryManager do
           state(),
           keyword()
         ) ::
-          {:ok, state()} | {:error, term(), state()}
+          {:ok, state()} | {:duplicate, term(), state()} | {:error, term(), state()}
   defp enqueue_request(op, target, payload, runtime_opts, from, state, opts \\ []) do
     now = System.system_time(:millisecond)
 
@@ -511,6 +581,8 @@ defmodule Jido.MemoryOS.MemoryManager do
     trace_id = normalize_trace_id(Keyword.get(runtime_opts, :correlation_id))
     agent_key = request_agent_key(target, runtime_opts)
     internal? = Keyword.get(opts, :internal?, false)
+    idempotency_key = normalize_optional_string(Keyword.get(runtime_opts, :idempotency_key))
+    replay_safe? = internal? or normalize_boolean(Keyword.get(runtime_opts, :replay_safe), false)
 
     request = %{
       id: "rq-" <> Integer.to_string(System.unique_integer([:positive, :monotonic])),
@@ -523,17 +595,45 @@ defmodule Jido.MemoryOS.MemoryManager do
       enqueued_at: now,
       deadline_ms: now + timeout_ms,
       trace_id: trace_id,
-      internal?: internal?
+      internal?: internal?,
+      idempotency_key: idempotency_key,
+      replay_safe?: replay_safe?
     }
 
-    with :ok <- ensure_queue_capacity(state, agent_key, internal?, trace_id) do
-      {:ok,
-       state
-       |> put_request_in_queue(agent_key, request)
-       |> increment_metric(:queued)}
-    else
-      {:error, overload} ->
-        {:error, overload, increment_metric(state, :overloaded)}
+    case maybe_reuse_idempotent_result(request, state) do
+      {:duplicate, result, state1} ->
+        {:duplicate, result, state1}
+
+      {:proceed, state1} ->
+        with :ok <- ensure_queue_capacity(state1, agent_key, internal?, trace_id) do
+          next_state =
+            state1
+            |> put_request_in_queue(agent_key, request)
+            |> increment_metric(:queued)
+            |> append_journal_event(%{
+              status: :queued,
+              request_id: request.id,
+              operation: request.op,
+              agent_key: request.agent_key,
+              trace_id: request.trace_id,
+              idempotency_key: request.idempotency_key,
+              internal?: request.internal?,
+              replay_safe?: request.replay_safe?,
+              request: replayable_request_payload(request)
+            })
+
+          {:ok, next_state}
+        else
+          {:error, overload} ->
+            metric =
+              if throttled_error?(overload) do
+                :throttled
+              else
+                :overloaded
+              end
+
+            {:error, overload, increment_metric(state1, metric)}
+        end
     end
   end
 
@@ -545,8 +645,52 @@ defmodule Jido.MemoryOS.MemoryManager do
     manager_cfg = state.policy_cache.manager
     queue_depth = state.queue_depth
     agent_depth = state.queue_by_agent |> Map.get(agent_key, :queue.new()) |> :queue.len()
+    adaptive? = map_get(manager_cfg, :adaptive_throttle_enabled, true)
+
+    target_depth =
+      max(
+        1,
+        normalize_integer(
+          map_get(manager_cfg, :adaptive_throttle_target_depth),
+          manager_cfg.queue_max_depth
+        )
+      )
+
+    soft_limit = normalize_unit_number(map_get(manager_cfg, :adaptive_throttle_soft_limit), 0.8)
+    effective_queue_limit = max(1, floor(manager_cfg.queue_max_depth * soft_limit))
+    effective_agent_limit = max(1, floor(manager_cfg.queue_per_agent * soft_limit))
 
     cond do
+      adaptive? and queue_depth >= target_depth and queue_depth >= effective_queue_limit ->
+        {:error,
+         Jido.Error.execution_error("memory manager admission throttled by adaptive control",
+           phase: :execution,
+           details: %{
+             code: :manager_throttled,
+             queue_depth: queue_depth,
+             target_depth: target_depth,
+             effective_queue_limit: effective_queue_limit,
+             retry_after_ms: max(25, div(manager_cfg.request_timeout_ms, 6)),
+             trace_id: trace_id
+           }
+         )}
+
+      adaptive? and queue_depth >= target_depth and agent_depth >= effective_agent_limit ->
+        {:error,
+         Jido.Error.execution_error("memory manager per-agent admission throttled",
+           phase: :execution,
+           details: %{
+             code: :manager_agent_throttled,
+             queue_depth: queue_depth,
+             target_depth: target_depth,
+             agent_key: agent_key,
+             agent_queue_depth: agent_depth,
+             effective_agent_limit: effective_agent_limit,
+             retry_after_ms: max(25, div(manager_cfg.request_timeout_ms, 6)),
+             trace_id: trace_id
+           }
+         )}
+
       queue_depth >= manager_cfg.queue_max_depth ->
         {:error,
          Jido.Error.execution_error("memory manager queue overloaded",
@@ -603,48 +747,199 @@ defmodule Jido.MemoryOS.MemoryManager do
 
   @spec dequeue_next_request(state()) :: {:empty, state()} | {:ok, request(), state()}
   defp dequeue_next_request(state) do
+    case scheduler_strategy(state) do
+      :fifo -> dequeue_next_request_fifo(state)
+      :weighted_priority -> dequeue_next_request_weighted(state)
+      _ -> dequeue_next_request_round_robin(state)
+    end
+  end
+
+  @spec dequeue_next_request_round_robin(state()) :: {:empty, state()} | {:ok, request(), state()}
+  defp dequeue_next_request_round_robin(state) do
     case :queue.out(state.agent_order) do
       {:empty, _} ->
         {:empty, state}
 
       {{:value, agent_key}, rest_order} ->
-        case Map.get(state.queue_by_agent, agent_key, :queue.new()) |> :queue.out() do
-          {:empty, _} ->
-            state1 = %{
-              state
-              | queue_by_agent: Map.delete(state.queue_by_agent, agent_key),
-                agent_order: rest_order,
-                scheduled_agents: MapSet.delete(state.scheduled_agents, agent_key)
-            }
-
-            dequeue_next_request(state1)
-
-          {{:value, request}, remaining_agent_queue} ->
-            {queue_by_agent, agent_order, scheduled_agents} =
-              if :queue.is_empty(remaining_agent_queue) do
-                {
-                  Map.delete(state.queue_by_agent, agent_key),
-                  rest_order,
-                  MapSet.delete(state.scheduled_agents, agent_key)
-                }
-              else
-                {
-                  Map.put(state.queue_by_agent, agent_key, remaining_agent_queue),
-                  :queue.in(agent_key, rest_order),
-                  state.scheduled_agents
-                }
-              end
-
-            {:ok, request,
-             %{
-               state
-               | queue_by_agent: queue_by_agent,
-                 agent_order: agent_order,
-                 scheduled_agents: scheduled_agents,
-                 queue_depth: max(0, state.queue_depth - 1)
-             }}
+        case pop_next_request_for_agent(state, agent_key, rest_order) do
+          {:empty, state1} -> dequeue_next_request_round_robin(state1)
+          result -> result
         end
     end
+  end
+
+  @spec dequeue_next_request_fifo(state()) :: {:empty, state()} | {:ok, request(), state()}
+  defp dequeue_next_request_fifo(state) do
+    case pick_agent_by_head(
+           state,
+           fn _agent_key, head_request, _queue_len, _wait_ms ->
+             head_request.enqueued_at
+           end,
+           :min
+         ) do
+      nil ->
+        {:empty, state}
+
+      {agent_key, _score} ->
+        case pop_next_request_for_agent(state, agent_key, state.agent_order) do
+          {:empty, state1} -> dequeue_next_request_fifo(state1)
+          result -> result
+        end
+    end
+  end
+
+  @spec dequeue_next_request_weighted(state()) :: {:empty, state()} | {:ok, request(), state()}
+  defp dequeue_next_request_weighted(state) do
+    wait_limit =
+      max(1, normalize_integer(map_get(state.policy_cache.manager, :fairness_max_wait_ms), 750))
+
+    bias =
+      max(1, normalize_integer(map_get(state.policy_cache.manager, :weighted_priority_bias), 3))
+
+    forced =
+      pick_agent_by_head(
+        state,
+        fn _agent_key, _head_request, _queue_len, wait_ms ->
+          wait_ms
+        end,
+        :max
+      )
+
+    weighted =
+      pick_agent_by_head(
+        state,
+        fn _agent_key, _head_request, queue_len, wait_ms ->
+          queue_len * bias + div(wait_ms, wait_limit)
+        end,
+        :max
+      )
+
+    candidate =
+      case {forced, weighted} do
+        {{forced_agent, forced_wait}, {_weighted_agent, _score}} when forced_wait >= wait_limit ->
+          {forced_agent, :forced}
+
+        {_forced, {weighted_agent, _score}} ->
+          {weighted_agent, :weighted}
+
+        _ ->
+          nil
+      end
+
+    case candidate do
+      nil ->
+        {:empty, state}
+
+      {agent_key, mode} ->
+        case pop_next_request_for_agent(state, agent_key, state.agent_order) do
+          {:empty, state1} ->
+            dequeue_next_request_weighted(state1)
+
+          {:ok, request, next_state} when mode == :forced ->
+            {:ok, request, increment_metric(next_state, :starvation_prevented)}
+
+          result ->
+            result
+        end
+    end
+  end
+
+  @spec pick_agent_by_head(
+          state(),
+          (String.t(), request(), non_neg_integer(), non_neg_integer() -> number()),
+          :min | :max
+        ) ::
+          {String.t(), number()} | nil
+  defp pick_agent_by_head(state, scorer, mode) do
+    now = System.system_time(:millisecond)
+
+    state.queue_by_agent
+    |> Enum.reduce(nil, fn {agent_key, queue}, best ->
+      case :queue.peek(queue) do
+        {:value, head_request} ->
+          queue_len = :queue.len(queue)
+          wait_ms = max(0, now - head_request.enqueued_at)
+          score = scorer.(agent_key, head_request, queue_len, wait_ms)
+          pick_better(mode, best, {agent_key, score})
+
+        :empty ->
+          best
+      end
+    end)
+  end
+
+  @spec pick_better(:min | :max, {String.t(), number()} | nil, {String.t(), number()}) ::
+          {String.t(), number()}
+  defp pick_better(_mode, nil, candidate), do: candidate
+
+  defp pick_better(:min, {_agent, best_score} = best, {_candidate_agent, score} = candidate),
+    do: if(score < best_score, do: candidate, else: best)
+
+  defp pick_better(:max, {_agent, best_score} = best, {_candidate_agent, score} = candidate),
+    do: if(score > best_score, do: candidate, else: best)
+
+  @spec pop_next_request_for_agent(state(), String.t(), :queue.queue(String.t())) ::
+          {:empty, state()} | {:ok, request(), state()}
+  defp pop_next_request_for_agent(state, agent_key, rest_order) do
+    case Map.get(state.queue_by_agent, agent_key, :queue.new()) |> :queue.out() do
+      {:empty, _} ->
+        state1 = %{
+          state
+          | queue_by_agent: Map.delete(state.queue_by_agent, agent_key),
+            agent_order: remove_agent_from_order(state.agent_order, agent_key),
+            scheduled_agents: MapSet.delete(state.scheduled_agents, agent_key)
+        }
+
+        {:empty, state1}
+
+      {{:value, request}, remaining_agent_queue} ->
+        strategy = scheduler_strategy(state)
+
+        {queue_by_agent, agent_order, scheduled_agents} =
+          if :queue.is_empty(remaining_agent_queue) do
+            {
+              Map.delete(state.queue_by_agent, agent_key),
+              remove_agent_from_order(rest_order, agent_key),
+              MapSet.delete(state.scheduled_agents, agent_key)
+            }
+          else
+            next_order =
+              if strategy == :round_robin do
+                :queue.in(agent_key, remove_agent_from_order(rest_order, agent_key))
+              else
+                rest_order
+              end
+
+            {
+              Map.put(state.queue_by_agent, agent_key, remaining_agent_queue),
+              next_order,
+              state.scheduled_agents
+            }
+          end
+
+        popped_state = %{
+          state
+          | queue_by_agent: queue_by_agent,
+            agent_order: agent_order,
+            scheduled_agents: scheduled_agents,
+            queue_depth: max(0, state.queue_depth - 1)
+        }
+
+        {:ok, request, popped_state}
+    end
+  end
+
+  @spec remove_agent_from_order(:queue.queue(String.t()), String.t()) :: :queue.queue(String.t())
+  defp remove_agent_from_order(order, agent_key) do
+    order
+    |> :queue.to_list()
+    |> Enum.reject(&(&1 == agent_key))
+    |> Enum.reduce(:queue.new(), fn key, acc -> :queue.in(key, acc) end)
+  end
+
+  @spec scheduler_strategy(state()) :: atom()
+  defp scheduler_strategy(state) do
+    map_get(state.policy_cache.manager, :scheduler_strategy, :round_robin)
   end
 
   @spec cancel_matching_requests(state(), String.t() | :any, operation() | :any) ::
@@ -718,10 +1013,24 @@ defmodule Jido.MemoryOS.MemoryManager do
 
   @spec execute_request(request(), state()) :: {term(), state()}
   defp execute_request(request, state) do
+    state =
+      append_journal_event(state, %{
+        status: :started,
+        request_id: request.id,
+        operation: request.op,
+        agent_key: request.agent_key,
+        trace_id: request.trace_id,
+        idempotency_key: request.idempotency_key,
+        internal?: request.internal?,
+        replay_safe?: request.replay_safe?,
+        request: replayable_request_payload(request)
+      })
+
     now = System.system_time(:millisecond)
 
     if now > request.deadline_ms do
-      timeout_result(request, state)
+      {result, state1} = timeout_result(request, state)
+      {result, finalize_request(request, result, state1)}
     else
       sleep_ms =
         max(0, normalize_integer(Keyword.get(request.runtime_opts, :operation_sleep_ms), 0))
@@ -729,22 +1038,39 @@ defmodule Jido.MemoryOS.MemoryManager do
       if sleep_ms > 0, do: Process.sleep(sleep_ms)
 
       if System.system_time(:millisecond) > request.deadline_ms do
-        timeout_result(request, state)
+        {result, state1} = timeout_result(request, state)
+        {result, finalize_request(request, result, state1)}
       else
         policy_context = policy_context(request)
         before_pointer = mutation_before_pointer(request, state)
 
         with {:ok, state1} <- enforce_policy(request, policy_context, state),
-             {:ok, state2} <- enforce_approval_if_required(request, policy_context, state1),
-             {result, state3} <- dispatch_request(request, state2) do
-          state4 = audit_operation_result(request, policy_context, result, before_pointer, state3)
-          {result, state4}
+             {:ok, state2} <- enforce_approval_if_required(request, policy_context, state1) do
+          case maybe_reuse_idempotent_result(request, state2) do
+            {:duplicate, result, state3} ->
+              state4 =
+                audit_operation_result(request, policy_context, result, before_pointer, state3)
+
+              {result, finalize_request(request, result, state4)}
+
+            {:proceed, state3} ->
+              {result, state4} = dispatch_request(request, state3)
+
+              state5 = maybe_invalidate_query_cache(state4, request, result)
+
+              state6 =
+                audit_operation_result(request, policy_context, result, before_pointer, state5)
+
+              {result, finalize_request(request, result, state6)}
+          end
         else
           {:error, reason, state1} ->
             result = {:error, to_jido_error(reason, request.op)}
 
-            {result,
-             audit_operation_result(request, policy_context, result, before_pointer, state1)}
+            state2 =
+              audit_operation_result(request, policy_context, result, before_pointer, state1)
+
+            {result, finalize_request(request, result, state2)}
         end
       end
     end
@@ -1060,42 +1386,49 @@ defmodule Jido.MemoryOS.MemoryManager do
     masking_mode =
       AccessPolicy.masking_mode(policy_ctx, map_get(state.policy_cache, :governance, %{}))
 
-    with {:ok, query} <-
-           Query.new(request.payload,
-             default_limit: state.policy_cache.retrieval.limit,
-             tier_mode: Keyword.get(request.runtime_opts, :tier_mode),
-             tier: Keyword.get(request.runtime_opts, :tier)
-           ),
-         query <- maybe_enable_explain_mode(query, explain?),
-         {:ok, retrieval} <-
-           run_retrieval_pipeline(request.target, query, request.runtime_opts, state) do
-      masked_records = DataSafety.mask_records(retrieval.records, masking_mode)
+    case Query.new(request.payload,
+           default_limit: state.policy_cache.retrieval.limit,
+           tier_mode: Keyword.get(request.runtime_opts, :tier_mode),
+           tier: Keyword.get(request.runtime_opts, :tier)
+         ) do
+      {:ok, query0} ->
+        query = maybe_enable_explain_mode(query0, explain?)
 
-      if explain? do
-        explain_payload = %{
-          query: Map.from_struct(query),
-          result_count: length(masked_records),
-          retrieval: state.policy_cache.retrieval,
-          lifecycle: state.policy_cache.lifecycle,
-          manager: state.policy_cache.manager,
-          tier_mode: retrieval.tier_mode,
-          planner: retrieval.plan,
-          queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
-          records: Enum.map(masked_records, &record_debug/1),
-          scored_candidates: retrieval.scored_candidates,
-          excluded: retrieval.excluded,
-          context_pack: retrieval.context_pack,
-          semantic_provider: retrieval.semantic,
-          decision_trace: retrieval.decision_trace,
-          selection_rationale: retrieval.selection_rationale,
-          recent_conflicts: state.last_conflicts
-        }
+        case fetch_retrieval_with_cache(request, query, state) do
+          {{:ok, retrieval}, state1} ->
+            masked_records = DataSafety.mask_records(retrieval.records, masking_mode)
 
-        {{:ok, DataSafety.mask_explain_payload(explain_payload, masking_mode)}, state}
-      else
-        {{:ok, masked_records}, state}
-      end
-    else
+            if explain? do
+              explain_payload = %{
+                query: Map.from_struct(query),
+                result_count: length(masked_records),
+                retrieval: state.policy_cache.retrieval,
+                lifecycle: state.policy_cache.lifecycle,
+                manager: state.policy_cache.manager,
+                tier_mode: retrieval.tier_mode,
+                planner: retrieval.plan,
+                queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
+                records: Enum.map(masked_records, &record_debug/1),
+                scored_candidates: retrieval.scored_candidates,
+                excluded: retrieval.excluded,
+                context_pack: retrieval.context_pack,
+                semantic_provider: retrieval.semantic,
+                decision_trace: retrieval.decision_trace,
+                selection_rationale: retrieval.selection_rationale,
+                recent_conflicts: state.last_conflicts
+              }
+
+              {{:ok, DataSafety.mask_explain_payload(explain_payload, masking_mode)}, state1}
+            else
+              {{:ok, masked_records}, state1}
+            end
+
+          {{:error, reason}, state1} ->
+            {{:error,
+              to_jido_error(reason, if(explain?, do: :explain_retrieval, else: :retrieve))},
+             state1}
+        end
+
       {:error, reason} ->
         {{:error, to_jido_error(reason, if(explain?, do: :explain_retrieval, else: :retrieve))},
          state}
@@ -2140,6 +2473,354 @@ defmodule Jido.MemoryOS.MemoryManager do
     |> increment_metric(:dead_lettered)
   end
 
+  @spec fetch_retrieval_with_cache(request(), Query.t(), state()) ::
+          {{:ok, map()} | {:error, term()}, state()}
+  defp fetch_retrieval_with_cache(request, query, state) do
+    if map_get(state.policy_cache.manager, :query_cache_enabled, true) do
+      signature = query_cache_signature(request.agent_key, query, request.runtime_opts)
+
+      ttl_ms =
+        max(1, normalize_integer(map_get(state.policy_cache.manager, :query_cache_ttl_ms), 500))
+
+      now = System.system_time(:millisecond)
+
+      case Map.get(state.query_cache, signature) do
+        %{retrieval: retrieval, cached_at: cached_at}
+        when is_map(retrieval) and is_integer(cached_at) and now - cached_at <= ttl_ms ->
+          {{:ok, retrieval}, increment_metric(state, :cache_hit)}
+
+        _stale_or_miss ->
+          state1 =
+            state
+            |> Map.update!(:query_cache, &Map.delete(&1, signature))
+            |> increment_metric(:cache_miss)
+
+          case run_retrieval_pipeline(request.target, query, request.runtime_opts, state1) do
+            {:ok, retrieval} ->
+              {{:ok, retrieval}, put_query_cache(state1, request.agent_key, signature, retrieval)}
+
+            {:error, reason} ->
+              {{:error, reason}, state1}
+          end
+      end
+    else
+      case run_retrieval_pipeline(request.target, query, request.runtime_opts, state) do
+        {:ok, retrieval} -> {{:ok, retrieval}, state}
+        {:error, reason} -> {{:error, reason}, state}
+      end
+    end
+  end
+
+  @spec maybe_invalidate_query_cache(state(), request(), term()) :: state()
+  defp maybe_invalidate_query_cache(state, request, {:ok, _result}) do
+    cond do
+      request.op == :policy_update ->
+        invalidate_all_query_cache(state)
+
+      request.op in [:remember, :forget, :prune, :consolidate] ->
+        invalidate_query_cache_for_agent(state, request.agent_key)
+
+      true ->
+        state
+    end
+  end
+
+  defp maybe_invalidate_query_cache(state, _request, _result), do: state
+
+  @spec invalidate_all_query_cache(state()) :: state()
+  defp invalidate_all_query_cache(state) do
+    removed = map_size(state.query_cache)
+
+    state
+    |> Map.put(:query_cache, %{})
+    |> Map.put(:query_cache_by_agent, %{})
+    |> increment_metric(:cache_invalidated, removed)
+  end
+
+  @spec invalidate_query_cache_for_agent(state(), String.t()) :: state()
+  defp invalidate_query_cache_for_agent(state, agent_key) do
+    signatures =
+      state.query_cache_by_agent |> Map.get(agent_key, MapSet.new()) |> MapSet.to_list()
+
+    removed = length(signatures)
+
+    next_cache =
+      Enum.reduce(signatures, state.query_cache, fn signature, acc ->
+        Map.delete(acc, signature)
+      end)
+
+    state
+    |> Map.put(:query_cache, next_cache)
+    |> Map.put(:query_cache_by_agent, Map.delete(state.query_cache_by_agent, agent_key))
+    |> increment_metric(:cache_invalidated, removed)
+  end
+
+  @spec put_query_cache(state(), String.t(), String.t(), map()) :: state()
+  defp put_query_cache(state, agent_key, signature, retrieval) do
+    max_entries =
+      max(
+        1,
+        normalize_integer(map_get(state.policy_cache.manager, :query_cache_max_entries), 512)
+      )
+
+    now = System.system_time(:millisecond)
+
+    next_cache =
+      state.query_cache
+      |> Map.put(signature, %{retrieval: retrieval, cached_at: now, agent_key: agent_key})
+      |> trim_query_cache(max_entries)
+
+    next_by_agent =
+      Enum.reduce(next_cache, %{}, fn {cache_signature, entry}, acc ->
+        cache_agent = map_get(entry, :agent_key, "unknown")
+        set = Map.get(acc, cache_agent, MapSet.new()) |> MapSet.put(cache_signature)
+        Map.put(acc, cache_agent, set)
+      end)
+
+    %{
+      state
+      | query_cache: next_cache,
+        query_cache_by_agent: next_by_agent
+    }
+  end
+
+  @spec trim_query_cache(map(), pos_integer()) :: map()
+  defp trim_query_cache(cache, max_entries) do
+    if map_size(cache) <= max_entries do
+      cache
+    else
+      cache
+      |> Enum.sort_by(fn {_signature, entry} -> map_get(entry, :cached_at, 0) end, :desc)
+      |> Enum.take(max_entries)
+      |> Map.new()
+    end
+  end
+
+  @spec query_cache_signature(String.t(), term(), term()) :: String.t()
+  defp query_cache_signature(agent_key, query, runtime_opts) do
+    payload = %{
+      agent_key: agent_key,
+      query: query,
+      tier: Keyword.get(runtime_opts, :tier),
+      tier_mode: Keyword.get(runtime_opts, :tier_mode)
+    }
+
+    payload
+    |> :erlang.term_to_binary()
+    |> then(&:crypto.hash(:sha256, &1))
+    |> Base.encode16(case: :lower)
+  end
+
+  @spec finalize_request(request(), term(), state()) :: state()
+  defp finalize_request(request, result, state) do
+    state1 =
+      append_journal_event(state, %{
+        status: :completed,
+        request_id: request.id,
+        operation: request.op,
+        agent_key: request.agent_key,
+        trace_id: request.trace_id,
+        idempotency_key: request.idempotency_key,
+        internal?: request.internal?,
+        replay_safe?: request.replay_safe?,
+        result_shape: result_shape(result),
+        result: result
+      })
+
+    if is_binary(request.idempotency_key) and request.idempotency_key != "" do
+      %{
+        state1
+        | idempotent_results: Map.put(state1.idempotent_results, request.idempotency_key, result)
+      }
+    else
+      state1
+    end
+  end
+
+  @spec maybe_reuse_idempotent_result(request(), state()) ::
+          {:proceed, state()} | {:duplicate, term(), state()}
+  defp maybe_reuse_idempotent_result(request, state) do
+    key = request.idempotency_key
+
+    if is_binary(key) and key != "" do
+      case Map.fetch(state.idempotent_results, key) do
+        {:ok, result} ->
+          state1 =
+            state
+            |> increment_metric(:idempotent_reused)
+            |> append_journal_event(%{
+              status: :idempotent_reuse,
+              request_id: request.id,
+              operation: request.op,
+              agent_key: request.agent_key,
+              trace_id: request.trace_id,
+              idempotency_key: key,
+              result_shape: result_shape(result)
+            })
+
+          {:duplicate, result, state1}
+
+        :error ->
+          {:proceed, state}
+      end
+    else
+      {:proceed, state}
+    end
+  end
+
+  @spec append_journal_event(state(), map()) :: state()
+  defp append_journal_event(%{journal_path: nil} = state, _event), do: state
+
+  defp append_journal_event(state, event) do
+    seq = length(state.journal_events) + 1
+
+    entry =
+      event
+      |> normalize_map()
+      |> Map.put_new(:seq, seq)
+      |> Map.put_new(:at, System.system_time(:millisecond))
+
+    _ = Journal.append(state.journal_path, entry)
+
+    request_id = Journal.event_request_id(entry)
+
+    next_index =
+      if is_binary(request_id),
+        do: Map.put(state.journal_index, request_id, entry),
+        else: state.journal_index
+
+    next_events = [entry | state.journal_events] |> Enum.take(state.journal_limit)
+
+    if length(next_events) == state.journal_limit and
+         length(state.journal_events) >= state.journal_limit do
+      _ = Journal.compact(state.journal_path, Enum.reverse(next_events))
+    end
+
+    %{state | journal_events: next_events, journal_index: next_index}
+  end
+
+  @spec resolve_journal_path(Config.t(), GenServer.server()) :: String.t() | nil
+  defp resolve_journal_path(config, server_name) do
+    configured = map_get(config.manager, :journal_path)
+
+    cond do
+      is_binary(configured) and String.trim(configured) != "" ->
+        String.trim(configured)
+
+      true ->
+        slug = Integer.to_string(:erlang.phash2(inspect(server_name)))
+        Path.join(System.tmp_dir!(), "jido_memory_os_journal_#{slug}.log")
+    end
+  end
+
+  @spec bootstrap_journal(String.t() | nil) :: {[map()], map(), map(), [map()]}
+  defp bootstrap_journal(nil), do: {[], %{}, %{}, []}
+
+  defp bootstrap_journal(path) do
+    case Journal.load(path) do
+      {:ok, events} ->
+        valid_events = Enum.filter(events, &is_map/1)
+        latest = Journal.build_index(valid_events)
+        idempotent_results = build_idempotent_results(latest)
+        replay_backlog = build_replay_backlog(latest)
+        {Enum.reverse(valid_events), latest, idempotent_results, replay_backlog}
+
+      {:error, _reason} ->
+        {[], %{}, %{}, []}
+    end
+  end
+
+  @spec build_idempotent_results(map()) :: map()
+  defp build_idempotent_results(latest_index) do
+    Enum.reduce(latest_index, %{}, fn {_request_id, event}, acc ->
+      status = map_get(event, :status)
+      key = map_get(event, :idempotency_key)
+      result = map_get(event, :result)
+
+      if status == :completed and is_binary(key) and key != "" do
+        Map.put(acc, key, result)
+      else
+        acc
+      end
+    end)
+  end
+
+  @spec build_replay_backlog(map()) :: [map()]
+  defp build_replay_backlog(latest_index) do
+    latest_index
+    |> Map.values()
+    |> Enum.filter(fn event ->
+      map_get(event, :status) in [:queued, :started] and
+        map_get(event, :replay_safe?, false) == true and
+        is_map(map_get(event, :request))
+    end)
+    |> Enum.sort_by(&map_get(&1, :at, 0), :asc)
+    |> Enum.map(fn event -> map_get(event, :request) end)
+    |> Enum.filter(&valid_replay_request?/1)
+  end
+
+  @spec valid_replay_request?(map()) :: boolean()
+  defp valid_replay_request?(request_map) do
+    map_get(request_map, :op) in [
+      :remember,
+      :retrieve,
+      :explain_retrieval,
+      :forget,
+      :prune,
+      :consolidate,
+      :policy_update
+    ]
+  end
+
+  @spec replayable_request_payload(request()) :: map()
+  defp replayable_request_payload(request) do
+    %{
+      op: request.op,
+      target: request.target,
+      payload: request.payload,
+      runtime_opts:
+        request.runtime_opts
+        |> Keyword.delete(:app_config)
+        |> Keyword.delete(:call_timeout)
+        |> Keyword.delete(:operation_sleep_ms)
+        |> Keyword.put(:replay_safe, true)
+        |> maybe_put_kw(:idempotency_key, request.idempotency_key)
+    }
+  end
+
+  @spec enqueue_replay_backlog(state(), [map()]) :: {state(), non_neg_integer()}
+  defp enqueue_replay_backlog(state, replay_backlog) do
+    Enum.reduce(replay_backlog, {state, 0}, fn replay_request, {acc_state, replayed} ->
+      op = map_get(replay_request, :op)
+      target = map_get(replay_request, :target, %{})
+      payload = map_get(replay_request, :payload)
+
+      runtime_opts =
+        replay_request
+        |> map_get(:runtime_opts, [])
+        |> normalize_keyword()
+        |> with_app_config(acc_state)
+
+      case enqueue_request(op, target, payload, runtime_opts, nil, acc_state, internal?: true) do
+        {:ok, next_state} ->
+          {next_state, replayed + 1}
+
+        {:duplicate, _result, next_state} ->
+          {next_state, replayed + 1}
+
+        {:error, _reason, next_state} ->
+          {next_state, replayed}
+      end
+    end)
+  end
+
+  @spec throttled_error?(term()) :: boolean()
+  defp throttled_error?(%Jido.Error.ExecutionError{details: details}) when is_map(details) do
+    Map.get(details, :code) in [:manager_throttled, :manager_agent_throttled]
+  end
+
+  defp throttled_error?(_), do: false
+
   @spec maybe_reply(state(), GenServer.from() | nil, term()) :: state()
   defp maybe_reply(state, nil, _result), do: state
 
@@ -2156,6 +2837,31 @@ defmodule Jido.MemoryOS.MemoryManager do
   @spec normalize_integer(term(), integer()) :: integer()
   defp normalize_integer(value, _fallback) when is_integer(value), do: value
   defp normalize_integer(_value, fallback), do: fallback
+
+  @spec normalize_unit_number(term(), float()) :: float()
+  defp normalize_unit_number(value, _fallback) when is_number(value) and value > 0 and value <= 1,
+    do: value * 1.0
+
+  defp normalize_unit_number(_value, fallback), do: fallback
+
+  @spec normalize_boolean(term(), boolean()) :: boolean()
+  defp normalize_boolean(value, _fallback) when is_boolean(value), do: value
+  defp normalize_boolean("true", _fallback), do: true
+  defp normalize_boolean("false", _fallback), do: false
+  defp normalize_boolean(_value, fallback), do: fallback
+
+  @spec normalize_keyword(term()) :: keyword()
+  defp normalize_keyword(value) when is_list(value) do
+    if Keyword.keyword?(value), do: value, else: []
+  end
+
+  defp normalize_keyword(%{} = map) do
+    map
+    |> Enum.filter(fn {key, _value} -> is_atom(key) end)
+    |> Enum.into([])
+  end
+
+  defp normalize_keyword(_), do: []
 
   @spec normalize_map(term()) :: map()
   defp normalize_map(%{} = map), do: map
