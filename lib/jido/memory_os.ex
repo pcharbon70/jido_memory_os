@@ -10,7 +10,7 @@ defmodule Jido.MemoryOS do
 
   @type target :: map() | struct()
   @type attrs :: map() | keyword()
-  @type query :: map() | keyword() | Jido.Memory.Query.t()
+  @type query :: map() | keyword() | Jido.Memory.Query.t() | Jido.MemoryOS.Query.t()
 
   @doc """
   Writes a memory record into the configured tier.

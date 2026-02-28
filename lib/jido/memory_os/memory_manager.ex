@@ -7,7 +7,8 @@ defmodule Jido.MemoryOS.MemoryManager do
   use GenServer
 
   alias Jido.MemoryOS.Adapter.MemoryRuntime
-  alias Jido.MemoryOS.{Config, ErrorMapping, Lifecycle, Metadata}
+  alias Jido.MemoryOS.{Config, ErrorMapping, Lifecycle, Metadata, Query}
+  alias Jido.MemoryOS.Retrieval.{Candidate, ContextPack, Planner, Ranker}
 
   @type candidate :: {String.t(), String.t()}
   @type operation :: :remember | :retrieve | :explain_retrieval | :forget | :prune | :consolidate
@@ -676,22 +677,32 @@ defmodule Jido.MemoryOS.MemoryManager do
 
   @spec retrieve_request(request(), state(), boolean()) :: {term(), state()}
   defp retrieve_request(request, state, explain?) do
-    with {:ok, query_map} <- to_query_map(request.payload),
+    with {:ok, query} <-
+           Query.new(request.payload,
+             default_limit: state.policy_cache.retrieval.limit,
+             tier_mode: Keyword.get(request.runtime_opts, :tier_mode),
+             tier: Keyword.get(request.runtime_opts, :tier)
+           ),
+         query <- maybe_enable_explain_mode(query, explain?),
          {:ok, retrieval} <-
-           run_retrieval_pipeline(request.target, query_map, request.runtime_opts, state) do
+           run_retrieval_pipeline(request.target, query, request.runtime_opts, state) do
       if explain? do
         {:ok,
          %{
-           query: query_map,
+           query: Map.from_struct(query),
            result_count: length(retrieval.records),
            retrieval: state.policy_cache.retrieval,
            lifecycle: state.policy_cache.lifecycle,
            manager: state.policy_cache.manager,
            tier_mode: retrieval.tier_mode,
+           planner: retrieval.plan,
            queue: %{depth: state.queue_depth, pending_agents: map_size(state.queue_by_agent)},
            records: Enum.map(retrieval.records, &record_debug/1),
            scored_candidates: retrieval.scored_candidates,
            excluded: retrieval.excluded,
+           context_pack: retrieval.context_pack,
+           semantic_provider: retrieval.semantic,
+           decision_trace: retrieval.decision_trace,
            selection_rationale: retrieval.selection_rationale,
            recent_conflicts: state.last_conflicts
          }}
@@ -704,6 +715,13 @@ defmodule Jido.MemoryOS.MemoryManager do
         {{:error, to_jido_error(reason, if(explain?, do: :explain_retrieval, else: :retrieve))},
          state}
     end
+  end
+
+  @spec maybe_enable_explain_mode(Query.t(), boolean()) :: Query.t()
+  defp maybe_enable_explain_mode(query, false), do: query
+
+  defp maybe_enable_explain_mode(%Query{} = query, true) do
+    %Query{query | include_excluded: true, debug: true}
   end
 
   @spec forget_request(request(), state()) :: {term(), state()}
@@ -724,109 +742,172 @@ defmodule Jido.MemoryOS.MemoryManager do
     {result, state1}
   end
 
-  @spec run_retrieval_pipeline(map() | struct(), map(), keyword(), state()) ::
+  @spec run_retrieval_pipeline(map() | struct(), Query.t(), keyword(), state()) ::
           {:ok, map()} | {:error, term()}
-  defp run_retrieval_pipeline(target, query_map, runtime_opts, state) do
-    tier_mode = resolve_tier_mode(query_map, runtime_opts)
-    tiers = mode_tiers(tier_mode)
-
-    limit =
-      normalize_integer(
-        map_get(query_map, :limit, state.policy_cache.retrieval.limit),
-        state.policy_cache.retrieval.limit
-      )
-
+  defp run_retrieval_pipeline(target, query, runtime_opts, state) do
     now = System.system_time(:millisecond)
 
-    base_query =
-      query_map
-      |> Map.drop([
-        :tier_mode,
-        "tier_mode",
-        :persona_keys,
-        "persona_keys",
-        :debug,
-        "debug",
-        :include_excluded,
-        "include_excluded"
-      ])
-      |> Map.put(:limit, max(limit * max(length(tiers), 1), limit))
-
-    with {:ok, fetched} <- fetch_tier_candidates(target, base_query, runtime_opts, tiers),
-         {:ok, ranked} <- rank_candidates(fetched, query_map, state.policy_cache.retrieval, now) do
-      selected = ranked |> Enum.take(limit)
-      selected_keys = MapSet.new(Enum.map(selected, &candidate_key(&1.record)))
+    with {:ok, plan0} <- Planner.plan(query, state.policy_cache.retrieval),
+         {:ok, primary_candidates} <-
+           fetch_tier_candidates(
+             target,
+             query,
+             runtime_opts,
+             plan0.primary_tiers,
+             plan0.fanout,
+             now
+           ),
+         plan <- Planner.apply_sparse_fallback(plan0, length(primary_candidates), query.limit),
+         {:ok, fallback_candidates} <-
+           fetch_additional_candidates(
+             target,
+             query,
+             runtime_opts,
+             plan0.primary_tiers,
+             plan,
+             now
+           ),
+         candidates <- dedupe_candidates(primary_candidates ++ fallback_candidates),
+         {:ok, ranking} <- Ranker.rank(query, candidates, state.policy_cache.retrieval) do
+      selected = Enum.take(ranking.ranked, query.limit)
+      selected_keys = MapSet.new(Enum.map(selected, & &1.candidate.key))
+      context_pack = ContextPack.build(query, selected)
 
       excluded =
-        ranked
-        |> Enum.reject(&(candidate_key(&1.record) in selected_keys))
-        |> Enum.map(fn candidate ->
+        if query.include_excluded do
+          ranking.ranked
+          |> Enum.reject(&MapSet.member?(selected_keys, &1.candidate.key))
+          |> Enum.map(fn ranked_candidate ->
+            %{
+              id: ranked_candidate.record.id,
+              namespace: ranked_candidate.record.namespace,
+              tier: ranked_candidate.tier,
+              reason: :below_rank_limit,
+              final_score: ranked_candidate.features.final_score
+            }
+          end)
+        else
+          []
+        end
+
+      scored_candidates =
+        Enum.map(selected, fn ranked_candidate ->
           %{
-            id: candidate.record.id,
-            namespace: candidate.record.namespace,
-            tier: candidate.tier,
-            reason: :below_rank_limit,
-            final_score: candidate.features.final_score
+            id: ranked_candidate.record.id,
+            namespace: ranked_candidate.record.namespace,
+            tier: ranked_candidate.tier,
+            features: ranked_candidate.features,
+            include_reason: include_reason(ranked_candidate, query)
           }
         end)
+
+      decision_trace = [
+        %{
+          stage: :planner,
+          mode: plan.mode,
+          primary_tiers: plan0.primary_tiers,
+          fallback_tiers: plan0.fallback_tiers,
+          fanout: plan.fanout
+        },
+        %{
+          stage: :fetch,
+          primary_candidates: length(primary_candidates),
+          fallback_candidates: length(fallback_candidates),
+          total_candidates: length(candidates)
+        },
+        %{
+          stage: :rank,
+          provider: inspect(ranking.semantic.provider),
+          degraded?: ranking.semantic.degraded?,
+          degradation_reason: ranking.semantic.reason
+        },
+        %{
+          stage: :context_pack,
+          tokens_used: context_pack.tokens_used,
+          token_budget: context_pack.token_budget,
+          truncated: context_pack.truncated
+        }
+      ]
 
       {:ok,
        %{
          records: Enum.map(selected, & &1.record),
-         tier_mode: tier_mode,
-         scored_candidates:
-           Enum.map(selected, fn candidate ->
-             %{
-               id: candidate.record.id,
-               namespace: candidate.record.namespace,
-               tier: candidate.tier,
-               features: candidate.features,
-               include_reason: :selected
-             }
-           end),
+         tier_mode: query.tier_mode,
+         plan: plan,
+         semantic: ranking.semantic,
+         context_pack: context_pack,
+         scored_candidates: scored_candidates,
          excluded: excluded,
+         decision_trace: decision_trace,
          selection_rationale: %{
            tie_breaker: "final_score desc, observed_at desc, id asc",
            weights: %{
              lexical: state.policy_cache.retrieval.ranking.lexical_weight,
              semantic: state.policy_cache.retrieval.ranking.semantic_weight,
-             recency_bonus: 0.15,
-             tier_bias: 0.1
+             recency_bonus: 0.12,
+             heat_bonus: 0.08,
+             persona_bonus: 0.06,
+             topic_bonus: 0.04,
+             tier_bias: "short=0.1, mid=0.05, long=0.0"
            }
          }
        }}
     end
   end
 
-  @spec fetch_tier_candidates(map() | struct(), map(), keyword(), [Config.tier()]) ::
-          {:ok, [map()]} | {:error, term()}
-  defp fetch_tier_candidates(target, query_map, runtime_opts, tiers) do
+  @spec fetch_tier_candidates(
+          map() | struct(),
+          Query.t(),
+          keyword(),
+          [Config.tier()],
+          map(),
+          integer()
+        ) :: {:ok, [Candidate.t()]} | {:error, term()}
+  defp fetch_tier_candidates(target, query, runtime_opts, tiers, fanout, now) do
     tiers
     |> Enum.reduce_while({:ok, []}, fn tier, {:ok, acc} ->
       tier_opts = Keyword.put(runtime_opts, :tier, tier)
+      tier_limit = Map.get(fanout, tier, query.limit)
+      query_filters = Query.to_runtime_filters(query, tier_limit)
 
-      case MemoryRuntime.recall(target, query_map, tier_opts) do
+      case MemoryRuntime.recall(target, query_filters, tier_opts) do
         {:ok, records} ->
-          tagged = Enum.map(records, &%{tier: tier, record: &1})
-          {:cont, {:ok, tagged ++ acc}}
+          normalized = Enum.map(records, &Candidate.from_record(&1, tier, now))
+          {:cont, {:ok, normalized ++ acc}}
 
         {:error, reason} ->
           {:halt, {:error, reason}}
       end
     end)
     |> case do
-      {:ok, tagged} -> {:ok, dedupe_candidates(tagged)}
+      {:ok, candidates} -> {:ok, candidates}
       {:error, reason} -> {:error, reason}
     end
   end
 
-  @spec dedupe_candidates([map()]) :: [map()]
+  @spec fetch_additional_candidates(
+          map() | struct(),
+          Query.t(),
+          keyword(),
+          [Config.tier()],
+          map(),
+          integer()
+        ) :: {:ok, [Candidate.t()]} | {:error, term()}
+  defp fetch_additional_candidates(target, query, runtime_opts, initial_tiers, plan, now) do
+    additional_tiers = plan.primary_tiers -- initial_tiers
+
+    if additional_tiers == [] do
+      {:ok, []}
+    else
+      fetch_tier_candidates(target, query, runtime_opts, additional_tiers, plan.fanout, now)
+    end
+  end
+
+  @spec dedupe_candidates([Candidate.t()]) :: [Candidate.t()]
   defp dedupe_candidates(candidates) do
     candidates
     |> Enum.reduce(%{}, fn candidate, acc ->
-      key = candidate_key(candidate.record)
-
-      Map.update(acc, key, candidate, fn existing ->
+      Map.update(acc, candidate.key, candidate, fn existing ->
         if tier_priority(candidate.tier) >= tier_priority(existing.tier) do
           candidate
         else
@@ -837,153 +918,24 @@ defmodule Jido.MemoryOS.MemoryManager do
     |> Map.values()
   end
 
-  @spec rank_candidates([map()], map(), map(), integer()) :: {:ok, [map()]} | {:error, term()}
-  defp rank_candidates(candidates, query_map, retrieval_cfg, now) do
-    persona_keys = normalize_tags(map_get(query_map, :persona_keys, []))
-    text_filter = map_get(query_map, :text_contains)
+  @spec include_reason(map(), Query.t()) :: map()
+  defp include_reason(ranked_candidate, query) do
+    candidate = ranked_candidate.candidate
 
-    ranked =
-      candidates
-      |> Enum.map(fn %{record: record, tier: tier} = candidate ->
-        heat = heat_component(record)
-        persona = persona_component(record, persona_keys)
-        semantic = Float.round(0.7 * heat + 0.3 * persona, 4)
-        lexical = lexical_component(record, text_filter)
-        recency = recency_component(record, now)
-        tier_bias = tier_bias(tier)
-
-        final_score =
-          Float.round(
-            retrieval_cfg.ranking.lexical_weight * lexical +
-              retrieval_cfg.ranking.semantic_weight * semantic +
-              0.15 * recency + tier_bias,
-            4
-          )
-
-        features = %{
-          lexical: lexical,
-          semantic: semantic,
-          recency: recency,
-          heat: heat,
-          persona: persona,
-          tier_bias: tier_bias,
-          final_score: final_score
-        }
-
-        Map.put(candidate, :features, features)
-      end)
-      |> Enum.sort(fn left, right ->
-        cond do
-          left.features.final_score > right.features.final_score ->
-            true
-
-          left.features.final_score < right.features.final_score ->
-            false
-
-          (left.record.observed_at || 0) > (right.record.observed_at || 0) ->
-            true
-
-          (left.record.observed_at || 0) < (right.record.observed_at || 0) ->
-            false
-
-          true ->
-            left.record.id <= right.record.id
-        end
-      end)
-
-    {:ok, ranked}
+    %{
+      selected: true,
+      matched_persona:
+        query.persona_keys == [] or Enum.any?(candidate.persona_keys, &(&1 in query.persona_keys)),
+      matched_topic:
+        query.topic_keys == [] or Enum.any?(candidate.topic_keys, &(&1 in query.topic_keys)),
+      policy_outcome: :ranked
+    }
   end
-
-  @spec resolve_tier_mode(map(), keyword()) :: atom()
-  defp resolve_tier_mode(query_map, runtime_opts) do
-    mode =
-      map_get(query_map, :tier_mode) ||
-        Keyword.get(runtime_opts, :tier_mode) ||
-        Keyword.get(runtime_opts, :tier, :short)
-
-    case mode do
-      :short -> :short
-      :mid -> :mid
-      :long -> :long
-      :hybrid -> :hybrid
-      :all -> :all
-      "short" -> :short
-      "mid" -> :mid
-      "long" -> :long
-      "hybrid" -> :hybrid
-      "all" -> :all
-      _ -> :short
-    end
-  end
-
-  @spec mode_tiers(atom()) :: [Config.tier()]
-  defp mode_tiers(:short), do: [:short]
-  defp mode_tiers(:mid), do: [:mid]
-  defp mode_tiers(:long), do: [:long]
-  defp mode_tiers(:hybrid), do: [:short, :mid, :long]
-  defp mode_tiers(:all), do: [:short, :mid, :long]
 
   @spec tier_priority(Config.tier()) :: integer()
   defp tier_priority(:short), do: 3
   defp tier_priority(:mid), do: 2
   defp tier_priority(:long), do: 1
-
-  @spec tier_bias(Config.tier()) :: number()
-  defp tier_bias(:short), do: 0.1
-  defp tier_bias(:mid), do: 0.05
-  defp tier_bias(:long), do: 0.0
-
-  @spec candidate_key(Jido.Memory.Record.t()) :: {String.t(), String.t()}
-  defp candidate_key(record), do: {record.namespace, record.id}
-
-  @spec recency_component(Jido.Memory.Record.t(), integer()) :: number()
-  defp recency_component(record, now) do
-    age = max(0, now - (record.observed_at || now))
-    clamp(1.0 - age / 86_400_000, 0.0, 1.0)
-  end
-
-  @spec heat_component(Jido.Memory.Record.t()) :: number()
-  defp heat_component(record) do
-    case Metadata.from_record(record) do
-      {:ok, mem_os} -> clamp(mem_os.heat, 0.0, 1.0)
-      _ -> 0.0
-    end
-  end
-
-  @spec persona_component(Jido.Memory.Record.t(), [String.t()]) :: number()
-  defp persona_component(_record, []), do: 0.5
-
-  defp persona_component(record, persona_keys) do
-    case Metadata.from_record(record) do
-      {:ok, mem_os} ->
-        if Enum.any?(mem_os.persona_keys, &(&1 in persona_keys)), do: 1.0, else: 0.0
-
-      _ ->
-        0.0
-    end
-  end
-
-  @spec lexical_component(Jido.Memory.Record.t(), term()) :: number()
-  defp lexical_component(_record, nil), do: 1.0
-
-  defp lexical_component(record, text_filter) when is_binary(text_filter) do
-    haystack =
-      cond do
-        is_binary(record.text) and record.text != "" -> record.text
-        true -> inspect(record.content)
-      end
-
-    if String.contains?(String.downcase(haystack), String.downcase(String.trim(text_filter))),
-      do: 1.0,
-      else: 0.0
-  end
-
-  defp lexical_component(_record, _text_filter), do: 1.0
-
-  @spec clamp(number(), number(), number()) :: number()
-  defp clamp(value, min_value, _max_value) when value < min_value, do: min_value
-  defp clamp(value, _min_value, max_value) when value > max_value, do: max_value
-  defp clamp(value, _min_value, _max_value), do: value
 
   @spec remember_short(map() | struct(), map() | keyword(), keyword(), state(), String.t()) ::
           {{:ok, Jido.Memory.Record.t()} | {:error, term()}, state()}
@@ -1805,31 +1757,9 @@ defmodule Jido.MemoryOS.MemoryManager do
     %{state | metrics: Map.update(state.metrics, metric, increment, &(&1 + increment))}
   end
 
-  @spec to_query_map(term()) :: {:ok, map()} | {:error, term()}
-  defp to_query_map(%Jido.Memory.Query{} = query), do: {:ok, Map.from_struct(query)}
-  defp to_query_map(%{} = query), do: {:ok, query}
-
-  defp to_query_map(list) when is_list(list) do
-    if Keyword.keyword?(list), do: {:ok, Map.new(list)}, else: {:error, :invalid_query}
-  end
-
-  defp to_query_map(_), do: {:error, :invalid_query}
-
   @spec normalize_integer(term(), integer()) :: integer()
   defp normalize_integer(value, _fallback) when is_integer(value), do: value
   defp normalize_integer(_value, fallback), do: fallback
-
-  @spec normalize_tags(term()) :: [String.t()]
-  defp normalize_tags(tags) when is_list(tags) do
-    tags
-    |> Enum.map(&to_string/1)
-    |> Enum.map(&String.trim/1)
-    |> Enum.reject(&(&1 == ""))
-    |> Enum.uniq()
-  end
-
-  defp normalize_tags(tags) when is_binary(tags), do: [String.trim(tags)]
-  defp normalize_tags(_), do: []
 
   @spec normalize_map(term()) :: map()
   defp normalize_map(%{} = map), do: map
