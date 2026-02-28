@@ -6,7 +6,7 @@ defmodule Jido.MemoryOS do
   using a stable API while internals evolve in later phases.
   """
 
-  alias Jido.MemoryOS.MemoryManager
+  alias Jido.MemoryOS.{MemoryManager, Migration}
 
   @type target :: map() | struct()
   @type attrs :: map() | keyword()
@@ -49,4 +49,16 @@ defmodule Jido.MemoryOS do
   @spec explain_retrieval(target(), query(), keyword()) :: {:ok, map()} | {:error, term()}
   def explain_retrieval(target, query, opts \\ []),
     do: MemoryManager.explain_retrieval(target, query, opts)
+
+  @doc """
+  Migrates legacy `jido_memory` records for one target into MemoryOS tiers.
+  """
+  @spec migrate_legacy(target(), keyword()) :: {:ok, map()} | {:error, term()}
+  def migrate_legacy(target, opts \\ []), do: Migration.migrate_target(target, opts)
+
+  @doc """
+  Compares legacy and MemoryOS record counts for one target.
+  """
+  @spec reconcile_legacy(target(), keyword()) :: {:ok, map()} | {:error, term()}
+  def reconcile_legacy(target, opts \\ []), do: Migration.reconcile_target(target, opts)
 end
