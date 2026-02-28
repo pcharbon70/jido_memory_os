@@ -1,53 +1,24 @@
 name: CI
 
 on:
+  pull_request:
   push:
     branches:
       - main
-      - "codex/**"
-  pull_request:
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+  lint:
+    name: Lint
+    uses: agentjido/github-actions/.github/workflows/elixir-lint.yml@main
+
   test:
-    name: Format and Test
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    env:
-      MIX_ENV: test
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Elixir and Erlang
-        uses: erlef/setup-beam@v1
-        with:
-          version-file: .tool-versions
-
-      - name: Restore Mix cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            deps
-            _build
-          key: ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}-${{ hashFiles('.tool-versions') }}
-          restore-keys: |
-            ${{ runner.os }}-mix-${{ hashFiles('mix.lock') }}-
-            ${{ runner.os }}-mix-
-
-      - name: Install dependencies
-        run: mix deps.get
-
-      - name: Compile
-        run: mix compile --warnings-as-errors
-
-      - name: Check formatting
-        run: mix format --check-formatted
-
-      - name: Run tests
-        run: mix test --no-color
+    name: Test
+    uses: agentjido/github-actions/.github/workflows/elixir-test.yml@main
+    with:
+      otp_versions: '["27", "28"]'
+      elixir_versions: '["1.18", "1.19"]'
+      test_command: mix test
