@@ -182,7 +182,8 @@ defmodule Jido.MemoryOS.Adapter.MemoryRuntime do
       |> put_trace_metadata(context, operation)
 
     Metadata.encode_attrs(attrs_with_trace, mem_os_updates,
-      previous_tier: Keyword.get(opts, :previous_tier)
+      previous_tier: Keyword.get(opts, :previous_tier),
+      strict_transition: Keyword.get(opts, :strict_transition, true)
     )
   end
 
