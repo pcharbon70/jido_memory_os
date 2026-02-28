@@ -54,7 +54,12 @@ defmodule Jido.MemoryOS.Metadata do
          updates <- normalize_patch_keys(mem_os_updates),
          {:ok, merged} <- normalize_mem_os_input(Map.merge(existing, updates)),
          :ok <- validate(merged),
-         :ok <- validate_transition(existing.tier, merged.tier, opts) do
+         :ok <-
+           validate_transition(
+             Keyword.get(opts, :previous_tier, existing.tier),
+             merged.tier,
+             opts
+           ) do
       mem_os_storage = to_storage_map(merged)
 
       merged_metadata =

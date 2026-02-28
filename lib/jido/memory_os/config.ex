@@ -11,12 +11,19 @@ defmodule Jido.MemoryOS.Config do
   alias Jido.MemoryOS.ConfigError
 
   @tiers [:short, :mid, :long]
-  @root_keys [:namespace_template, :tiers, :retrieval, :plugin, :safety]
+  @root_keys [:namespace_template, :tiers, :retrieval, :plugin, :safety, :lifecycle]
   @tier_keys [:namespace_suffix, :store, :store_opts, :max_records, :ttl_ms, :promotion_threshold]
   @retrieval_keys [:limit, :ranking, :fallback]
   @ranking_keys [:lexical_weight, :semantic_weight]
   @plugin_keys [:route_prefix, :auto_capture, :capture_signal_patterns]
   @safety_keys [:audit_enabled, :redaction_enabled, :pii_strategy]
+  @lifecycle_keys [
+    :segment_max_events,
+    :segment_max_tokens,
+    :page_max_segments,
+    :conflict_strategy,
+    :promotion_min_score
+  ]
 
   @defaults %{
     namespace_template: "agent:%{agent_id}:%{tier}",
@@ -57,6 +64,13 @@ defmodule Jido.MemoryOS.Config do
       audit_enabled: true,
       redaction_enabled: true,
       pii_strategy: :mask
+    },
+    lifecycle: %{
+      segment_max_events: 8,
+      segment_max_tokens: 512,
+      page_max_segments: 4,
+      conflict_strategy: :version,
+      promotion_min_score: 0.5
     }
   }
 
@@ -70,7 +84,8 @@ defmodule Jido.MemoryOS.Config do
           },
           retrieval: map(),
           plugin: map(),
-          safety: map()
+          safety: map(),
+          lifecycle: map()
         }
 
   @doc """
@@ -119,6 +134,7 @@ defmodule Jido.MemoryOS.Config do
     {retrieval, errors} = validate_retrieval(Map.get(root_overrides, :retrieval), errors)
     {plugin, errors} = validate_plugin(Map.get(root_overrides, :plugin), errors)
     {safety, errors} = validate_safety(Map.get(root_overrides, :safety), errors)
+    {lifecycle, errors} = validate_lifecycle(Map.get(root_overrides, :lifecycle), errors)
 
     if errors == [] do
       {:ok,
@@ -127,7 +143,8 @@ defmodule Jido.MemoryOS.Config do
          tiers: tiers,
          retrieval: retrieval,
          plugin: plugin,
-         safety: safety
+         safety: safety,
+         lifecycle: lifecycle
        }}
     else
       {:error, Enum.reverse(errors)}
@@ -489,6 +506,84 @@ defmodule Jido.MemoryOS.Config do
      }, errors}
   end
 
+  @spec validate_lifecycle(term(), [ConfigError.t()]) :: {map(), [ConfigError.t()]}
+  defp validate_lifecycle(value, errors) do
+    path = [:lifecycle]
+    {input, errors} = normalize_section_map(value, path, errors)
+    {normalized, unknown} = normalize_known_keys(input, @lifecycle_keys)
+
+    errors =
+      Enum.reduce(unknown, errors, fn key, acc ->
+        [
+          error(path ++ [to_path_key(key)], :unknown_field, "unknown lifecycle config key", key)
+          | acc
+        ]
+      end)
+
+    segment_max_events =
+      map_get(normalized, :segment_max_events, @defaults.lifecycle.segment_max_events)
+
+    {segment_max_events, errors} =
+      validate_positive_integer(
+        segment_max_events,
+        path ++ [:segment_max_events],
+        errors,
+        @defaults.lifecycle.segment_max_events
+      )
+
+    segment_max_tokens =
+      map_get(normalized, :segment_max_tokens, @defaults.lifecycle.segment_max_tokens)
+
+    {segment_max_tokens, errors} =
+      validate_positive_integer(
+        segment_max_tokens,
+        path ++ [:segment_max_tokens],
+        errors,
+        @defaults.lifecycle.segment_max_tokens
+      )
+
+    page_max_segments =
+      map_get(normalized, :page_max_segments, @defaults.lifecycle.page_max_segments)
+
+    {page_max_segments, errors} =
+      validate_positive_integer(
+        page_max_segments,
+        path ++ [:page_max_segments],
+        errors,
+        @defaults.lifecycle.page_max_segments
+      )
+
+    conflict_strategy =
+      map_get(normalized, :conflict_strategy, @defaults.lifecycle.conflict_strategy)
+
+    {conflict_strategy, errors} =
+      validate_conflict_strategy(
+        conflict_strategy,
+        path ++ [:conflict_strategy],
+        errors,
+        @defaults.lifecycle.conflict_strategy
+      )
+
+    promotion_min_score =
+      map_get(normalized, :promotion_min_score, @defaults.lifecycle.promotion_min_score)
+
+    {promotion_min_score, errors} =
+      validate_unit_number(
+        promotion_min_score,
+        path ++ [:promotion_min_score],
+        errors,
+        @defaults.lifecycle.promotion_min_score
+      )
+
+    {%{
+       segment_max_events: segment_max_events,
+       segment_max_tokens: segment_max_tokens,
+       page_max_segments: page_max_segments,
+       conflict_strategy: conflict_strategy,
+       promotion_min_score: promotion_min_score
+     }, errors}
+  end
+
   @spec validate_store(term(), term(), [atom()], [ConfigError.t()], {module(), keyword()}) ::
           {{module(), keyword()}, [ConfigError.t()]}
   defp validate_store(store_value, store_opts, path, errors, fallback_store) do
@@ -557,6 +652,36 @@ defmodule Jido.MemoryOS.Config do
       {normalized, errors}
     else
       {fallback, [error(path, :invalid_value, "must be :mask, :drop, or :allow", value) | errors]}
+    end
+  end
+
+  @spec validate_conflict_strategy(term(), [atom()], [ConfigError.t()], atom()) ::
+          {atom(), [ConfigError.t()]}
+  defp validate_conflict_strategy(value, path, errors, fallback) do
+    normalized =
+      case value do
+        :replace -> :replace
+        :append -> :append
+        :version -> :version
+        "replace" -> :replace
+        "append" -> :append
+        "version" -> :version
+        _ -> nil
+      end
+
+    if normalized do
+      {normalized, errors}
+    else
+      {fallback,
+       [
+         error(
+           path,
+           :invalid_value,
+           "must be :replace, :append, or :version",
+           value
+         )
+         | errors
+       ]}
     end
   end
 
