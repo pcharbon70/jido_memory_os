@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+find_asdf() {
+  if command -v asdf >/dev/null 2>&1; then
+    command -v asdf
+    return 0
+  fi
+
+  for candidate in "$HOME/.asdf/bin/asdf" /opt/homebrew/bin/asdf /usr/local/bin/asdf; do
+    if [ -x "$candidate" ]; then
+      echo "$candidate"
+      return 0
+    fi
+  done
+
+  local cellar_asdf
+  cellar_asdf="$(ls -1 /opt/homebrew/Cellar/asdf/*/bin/asdf 2>/dev/null | tail -n 1 || true)"
+  if [ -n "$cellar_asdf" ] && [ -x "$cellar_asdf" ]; then
+    echo "$cellar_asdf"
+    return 0
+  fi
+
+  return 1
+}
+
+ASDF_BIN="$(find_asdf || true)"
+if [ -z "$ASDF_BIN" ]; then
+  echo "[pre-commit] asdf was not found; install or expose it on PATH."
+  exit 1
+fi
+
+export ASDF_DATA_DIR="${ASDF_DATA_DIR:-$HOME/.asdf}"
+ERLANG_DIR="$("$ASDF_BIN" where erlang 2>/dev/null || true)"
+ELIXIR_DIR="$("$ASDF_BIN" where elixir 2>/dev/null || true)"
+
+if [ -z "$ERLANG_DIR" ] || [ -z "$ELIXIR_DIR" ]; then
+  echo "[pre-commit] Erlang/Elixir versions are not installed for this repo. Run 'asdf install'."
+  exit 1
+fi
+
+export PATH="$ERLANG_DIR/bin:$ELIXIR_DIR/bin:$PATH"
+
+if ! mix hex.info >/dev/null 2>&1; then
+  echo "[pre-commit] Bootstrapping Hex/Rebar..."
+  mix local.hex --force >/dev/null
+  mix local.rebar --force >/dev/null
+fi
+
+echo "[pre-commit] Running test suite..."
+mix test
+
+echo "[pre-commit] Running Credo..."
+mix credo --strict
+
+echo "[pre-commit] Running Dialyzer..."
+mix dialyzer
+
+echo "[pre-commit] All checks passed."
