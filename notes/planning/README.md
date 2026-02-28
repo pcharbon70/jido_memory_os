@@ -47,11 +47,11 @@ This directory contains the phase-by-phase implementation plan for MemoryOS buil
 - Retrieval defaults to hybrid ranking (semantic optional with lexical fallback).
 
 ## Cross-Phase Acceptance Scenarios
-- [ ] X-1 Description: Long multi-session persona recall remains consistent after multiple consolidations.
-- [ ] X-2 Description: Contradictory user facts are handled deterministically with explainable lineage.
-- [ ] X-3 Description: Concurrent mixed workloads satisfy latency and throughput SLOs.
-- [ ] X-4 Description: Unauthorized cross-agent access is blocked and fully audited.
-- [ ] X-5 Description: Sensitive memory is redacted/masked according to policy at write and retrieval time.
-- [ ] X-6 Description: Crash/restart during consolidation recovers without duplicate or lost updates.
-- [ ] X-7 Description: Migration from legacy `jido_memory` records preserves retrieval quality and integrity.
-- [ ] X-8 Description: Canary rollout, rollback, and fallback behaviors work predictably under incident simulation.
+- [x] X-1 Description: Long multi-session persona recall remains consistent after multiple consolidations.
+- [x] X-2 Description: Contradictory user facts are handled deterministically with explainable lineage.
+- [x] X-3 Description: Concurrent mixed workloads satisfy latency and throughput SLOs.
+- [x] X-4 Description: Unauthorized cross-agent access is blocked and fully audited.
+- [x] X-5 Description: Sensitive memory is redacted/masked according to policy at write and retrieval time.
+- [x] X-6 Description: Crash/restart during consolidation recovers without duplicate or lost updates.
+- [x] X-7 Description: Migration from legacy `jido_memory` records preserves retrieval quality and integrity.
+- [x] X-8 Description: Canary rollout, rollback, and fallback behaviors work predictably under incident simulation.
