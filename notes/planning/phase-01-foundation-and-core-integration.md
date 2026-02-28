@@ -13,89 +13,89 @@ Back to index: [README](./README.md)
 - Namespace format defaults to `agent:<id>:short|mid|long`.
 - API return shape is `{:ok, value} | {:error, reason}`.
 
-[ ] 1 Phase 1 - Foundation and `jido_memory` Core Integration  
+[x] 1 Phase 1 - Foundation and `jido_memory` Core Integration  
 Description: Establish project skeleton, validated config, and adapter boundaries so MemoryOS can safely build on top of `jido_memory`.
 
-[ ] 1.1 Section - Repository and Module Bootstrap  
+[x] 1.1 Section - Repository and Module Bootstrap  
 Description: Create implementation-ready module layout and supervision boundaries.
 
-[ ] 1.1.1 Task - Define module structure  
+[x] 1.1.1 Task - Define module structure  
 Description: Create module namespaces and ownership boundaries.
-[ ] 1.1.1.1 Subtask - Create top-level modules (`Jido.MemoryOS`, `Jido.MemoryOS.MemoryManager`, `Jido.MemoryOS.Config`).  
+[x] 1.1.1.1 Subtask - Create top-level modules (`Jido.MemoryOS`, `Jido.MemoryOS.MemoryManager`, `Jido.MemoryOS.Config`).  
 Description: Ensure compile-ready stubs with docs/specs.
-[ ] 1.1.1.2 Subtask - Create action/plugin namespaces.  
+[x] 1.1.1.2 Subtask - Create action/plugin namespaces.  
 Description: Prepare `actions/` and plugin modules with schema placeholders.
-[ ] 1.1.1.3 Subtask - Define supervisor tree shape.  
+[x] 1.1.1.3 Subtask - Define supervisor tree shape.  
 Description: Add placeholders for manager workers and maintenance workers.
 
-[ ] 1.1.2 Task - Add dependency contract with `jido_memory`  
+[x] 1.1.2 Task - Add dependency contract with `jido_memory`  
 Description: Isolate external dependency and prevent API drift risks.
-[ ] 1.1.2.1 Subtask - Pin dependency version and compatibility matrix.  
+[x] 1.1.2.1 Subtask - Pin dependency version and compatibility matrix.  
 Description: Lock supported versions and fail fast on unsupported versions.
-[ ] 1.1.2.2 Subtask - Add compile-time capability checks.  
+[x] 1.1.2.2 Subtask - Add compile-time capability checks.  
 Description: Verify required runtime functions are present.
-[ ] 1.1.2.3 Subtask - Define compatibility policy.  
+[x] 1.1.2.3 Subtask - Define compatibility policy.  
 Description: Standardize handling for future `jido_memory` upgrades.
 
-[ ] 1.2 Section - Config Schema and Defaults  
+[x] 1.2 Section - Config Schema and Defaults  
 Description: Define all runtime knobs and defaults as validated config.
 
-[ ] 1.2.1 Task - Implement `Jido.MemoryOS.Config` schema  
+[x] 1.2.1 Task - Implement `Jido.MemoryOS.Config` schema  
 Description: Encode tier, retrieval, plugin, and safety settings.
-[ ] 1.2.1.1 Subtask - Add tier default policies.  
+[x] 1.2.1.1 Subtask - Add tier default policies.  
 Description: Windows, caps, TTLs, promotion thresholds.
-[ ] 1.2.1.2 Subtask - Add retrieval default policies.  
+[x] 1.2.1.2 Subtask - Add retrieval default policies.  
 Description: Limits, ranking weights, fallback behavior.
-[ ] 1.2.1.3 Subtask - Add plugin and capture defaults.  
+[x] 1.2.1.3 Subtask - Add plugin and capture defaults.  
 Description: Signal patterns, auto-capture toggle, route options.
 
-[ ] 1.2.2 Task - Implement config normalization/precedence  
+[x] 1.2.2 Task - Implement config normalization/precedence  
 Description: Ensure deterministic runtime behavior.
-[ ] 1.2.2.1 Subtask - Merge precedence rules.  
+[x] 1.2.2.1 Subtask - Merge precedence rules.  
 Description: Call options > plugin state > app config.
-[ ] 1.2.2.2 Subtask - Normalize namespace/store values.  
+[x] 1.2.2.2 Subtask - Normalize namespace/store values.  
 Description: Resolve per-tier store and namespace values.
-[ ] 1.2.2.3 Subtask - Normalize and report schema errors.  
+[x] 1.2.2.3 Subtask - Normalize and report schema errors.  
 Description: Return structured error payloads with field paths.
 
-[ ] 1.3 Section - `jido_memory` Adapter Layer  
+[x] 1.3 Section - `jido_memory` Adapter Layer  
 Description: Create a stable bridge that wraps `Jido.Memory.Runtime`.
 
-[ ] 1.3.1 Task - Implement runtime adapter methods  
+[x] 1.3.1 Task - Implement runtime adapter methods  
 Description: Wrap remember/get/recall/forget/prune in one module.
-[ ] 1.3.1.1 Subtask - Add write/read wrappers with option injection.  
+[x] 1.3.1.1 Subtask - Add write/read wrappers with option injection.  
 Description: Auto-attach tier namespace and store config.
-[ ] 1.3.1.2 Subtask - Normalize upstream errors.  
+[x] 1.3.1.2 Subtask - Normalize upstream errors.  
 Description: Map to stable MemoryOS error taxonomy.
-[ ] 1.3.1.3 Subtask - Add trace metadata.  
+[x] 1.3.1.3 Subtask - Add trace metadata.  
 Description: Attach correlation IDs and operation tags.
 
-[ ] 1.3.2 Task - Implement MemoryOS metadata encoder/decoder  
+[x] 1.3.2 Task - Implement MemoryOS metadata encoder/decoder  
 Description: Standardize `metadata["mem_os"]`.
-[ ] 1.3.2.1 Subtask - Encode lifecycle fields.  
+[x] 1.3.2.1 Subtask - Encode lifecycle fields.  
 Description: Persist tier, lineage, heat, and promotion fields.
-[ ] 1.3.2.2 Subtask - Decode with backward-compatible defaults.  
+[x] 1.3.2.2 Subtask - Decode with backward-compatible defaults.  
 Description: Handle missing fields safely.
-[ ] 1.3.2.3 Subtask - Validate metadata schema.  
+[x] 1.3.2.3 Subtask - Validate metadata schema.  
 Description: Reject invalid tier/lifecycle state transitions.
 
-[ ] 1.4 Section - Phase 1 Integration Tests  
+[x] 1.4 Section - Phase 1 Integration Tests  
 Description: Validate bootstrap and compatibility end-to-end.
 
-[ ] 1.4.1 Task - Bootstrap integration tests  
+[x] 1.4.1 Task - Bootstrap integration tests  
 Description: Ensure app startup, config loading, and adapter health.
-[ ] 1.4.1.1 Subtask - Start system with defaults.  
+[x] 1.4.1.1 Subtask - Start system with defaults.  
 Description: Verify supervision and required processes.
-[ ] 1.4.1.2 Subtask - Smoke test wrapped runtime operations.  
+[x] 1.4.1.2 Subtask - Smoke test wrapped runtime operations.  
 Description: Validate remember/recall/forget via adapter.
-[ ] 1.4.1.3 Subtask - Assert namespace/store resolution.  
+[x] 1.4.1.3 Subtask - Assert namespace/store resolution.  
 Description: Verify per-tier deterministic values.
 
-[ ] 1.4.2 Task - Contract integration tests  
+[x] 1.4.2 Task - Contract integration tests  
 Description: Validate API and error contracts are stable.
-[ ] 1.4.2.1 Subtask - Check metadata encoding/decoding roundtrip.  
+[x] 1.4.2.1 Subtask - Check metadata encoding/decoding roundtrip.  
 Description: Validate lifecycle fields survive persistence.
-[ ] 1.4.2.2 Subtask - Check structured config errors.  
+[x] 1.4.2.2 Subtask - Check structured config errors.  
 Description: Invalid config returns path-aware errors.
-[ ] 1.4.2.3 Subtask - Check dependency compatibility guards.  
+[x] 1.4.2.3 Subtask - Check dependency compatibility guards.  
 Description: Fail fast with clear diagnostics.
